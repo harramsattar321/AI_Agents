@@ -24,6 +24,7 @@ Intent detection — keyword-only (zero tokens, zero latency):
 """
 
 import re
+
 from chatbot         import HospitalChatbot    # Agent 1
 from booking_agent   import BookingAgent       # Agent 2
 from insurance_agent import InsuranceAgent     # Agent 3
@@ -42,6 +43,11 @@ GROQ_KEY_INS = os.getenv("GROQ_KEY_INS")
 # ─────────────────────────────────────────────────────────────────────────────
 #  INTENT DETECTORS  (keyword-only, zero tokens)
 # ─────────────────────────────────────────────────────────────────────────────
+_CANCEL_BOOKING_RE = re.compile(
+    r"\b(cancel appointment|cancel my appointment|reschedule|re.?schedule|change appointment|reappointment)\b",
+    re.IGNORECASE
+)
+
 _BOOKING_RE = re.compile(
     r"\b("
     r"book|appointment|appoint|schedule|reserve"
@@ -150,7 +156,13 @@ def _format_booking_terminal(reply: str, patient_name: str) -> str:
             f"Feel free to ask me anything else!"
         )
     return reply
+_CANCEL_BOOKING_RE = re.compile(
+    r"\b(cancel appointment|cancel my appointment|reschedule|re.?schedule|change appointment|reappointment)\b",
+    re.IGNORECASE
+)
 
+def _is_cancel_or_reschedule(text: str) -> bool:
+    return bool(_CANCEL_BOOKING_RE.search(text))
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  ROUTER
@@ -205,7 +217,8 @@ class Router:
 
     def _wants_to_cancel(self, text: str) -> bool:
         return bool(self._CANCEL_RE.search(text))
-
+    def _is_cancel_or_reschedule(text: str) -> bool:
+        return bool(_CANCEL_BOOKING_RE.search(text))
     # ── Single turn dispatcher ────────────────────────────────────────────────
     def handle(self, user_input: str) -> str:
         # Keep display_history bounded to avoid memory bloat
@@ -231,24 +244,47 @@ class Router:
         # ══════════════════════════════════════════════════════════════════════
         if self.state == self.CHAT:
 
-            # CHAT → BOOKING
-            if _is_booking_intent(user_input):
-                self.state = self.BOOKING
-                self.booking_agent.reset()
-                booking_reply, is_terminal = self.booking_agent.respond(user_input)
-                reply = self._wrap_booking(booking_reply, is_terminal)
+            # 🔴 Cancel / Reschedule
+            if _is_cancel_or_reschedule(user_input):
+                reply = (
+                    "\n" + "═" * 50 + "\n"
+                    "        🔄  MANAGE YOUR APPOINTMENT\n"
+                    + "═" * 50 + "\n\n"
+                    " Please click the 'Appointment Button'\n"
+                    " to open the Appointment Management page.\n\n"
+                    " There you can:\n"
+                    "   • Cancel Appointment\n"
+                    "   • Re-schedule Appointment\n\n"
+                    " Quick • Simple • Hassle-Free\n\n"
+                    f"Need anything else, {self.patient_name}?\n"
+                )
 
-            # CHAT → INSURANCE
+            # 🟢 Booking → ONLY MESSAGE (NO AI)
+            elif _is_booking_intent(user_input):
+                reply = (
+                        "\n" + "═" * 50 + "\n"
+                        "            APPOINTMENT BOOKING\n"
+                        + "═" * 50 + "\n\n"
+                        "Please click the 'Appointment Button' to begin.\n\n"
+                        "Follow these simple steps:\n"
+                        "   1️⃣ Select your preferred doctor\n"
+                        "   2️⃣ Choose a suitable date\n"
+                        "   3️⃣ Pick an available time slot\n"
+                        "   4️⃣ Click 'Confirm Appointment'\n\n"
+                        " Your appointment will be successfully scheduled.\n\n"
+                        "⚡ Fast • Easy • Secure\n\n"
+                        f"How else can I assist you, {self.patient_name}?\n"
+                    )
+
+            # 🔵 Insurance
             elif _is_insurance_intent(user_input):
                 self.state = self.INSURANCE
                 self.insurance_agent.reset()
-                ins_reply = self.insurance_agent.respond(user_input)
-                reply = f"[INSURANCE DESK]: {ins_reply}"
+                reply = self.insurance_agent.respond(user_input)
 
-            # Stay in CHAT (general query)
+            # 🟡 General
             else:
                 reply = self.chat_agent.ask(user_input)
-
         # ══════════════════════════════════════════════════════════════════════
         #  STATE: BOOKING
         # ══════════════════════════════════════════════════════════════════════
@@ -262,23 +298,15 @@ class Router:
             if _is_general_intent(user_input):
                 self.state = self.CHAT
                 self.booking_agent.reset()
-                bridge = (
-                    f"Sure, {self.patient_name}! Let me pass you back to our "
-                    f"general receptionist.\n{'─' * 48}"
-                )
                 chat_reply = self.chat_agent.ask(user_input)
-                reply = f"{bridge}\n{chat_reply}"
+                reply = f"{chat_reply}"
 
             # BOOKING → INSURANCE (patient asks about insurance mid-booking)
             elif _is_insurance_intent(user_input):
                 self.state = self.INSURANCE
                 self.booking_agent.reset()
-                bridge = (
-                    f"Of course, {self.patient_name}! Let me connect you with our "
-                    f"Insurance Desk. Your booking session has been paused.\n{'─' * 48}"
-                )
                 ins_reply = self.insurance_agent.respond(user_input)
-                reply = f"{bridge}\n[INSURANCE DESK]: {ins_reply}"
+                reply = f"{ins_reply}"
 
             # Continue BOOKING conversation
             else:
@@ -298,24 +326,16 @@ class Router:
             if _is_general_intent(user_input):
                 self.state = self.CHAT
                 self.insurance_agent.reset()
-                bridge = (
-                    f"Sure, {self.patient_name}! Let me pass you back to our "
-                    f"general receptionist.\n{'─' * 48}"
-                )
                 chat_reply = self.chat_agent.ask(user_input)
-                reply = f"{bridge}\n{chat_reply}"
+                reply = f"{chat_reply}"
 
             # INSURANCE → BOOKING (patient wants to book mid-insurance)
             elif _is_booking_intent(user_input):
                 self.state = self.BOOKING
                 self.booking_agent.reset()
-                bridge = (
-                    f"Sure, {self.patient_name}! Let me connect you with our "
-                    f"Booking Clerk.\n{'─' * 48}"
-                )
                 booking_reply, is_terminal = self.booking_agent.respond(user_input)
                 reply = (
-                    f"{bridge}\n[BOOKING CLERK]: {booking_reply}"
+                    f"{booking_reply}"
                     if not is_terminal
                     else self._wrap_booking(booking_reply, is_terminal)
                 )
@@ -332,12 +352,12 @@ class Router:
                     self.state = self.CHAT
                     self.insurance_agent.reset()
                     reply = (
-                        f"[INSURANCE DESK]: {ins_reply}\n\n"
+                        f"{ins_reply}\n\n"
                         f"Feel free to ask me anything else, {self.patient_name}! "
                         f"I'm back as your general receptionist."
                     )
                 else:
-                    reply = f"[INSURANCE DESK]: {ins_reply}"
+                    reply = f"{ins_reply}"
 
         else:
             # Safety fallback — should never be reached
@@ -352,7 +372,7 @@ class Router:
             self.state = self.CHAT
             self.booking_agent.reset()
             return _format_booking_terminal(reply, self.patient_name)
-        return f"[BOOKING CLERK]: {reply}"
+        return f"{reply}"
 
     def close(self):
         self.db.close()

@@ -112,7 +112,7 @@ class HospitalChatbot:
                     f"ACTIVE CONTEXT: {self.current_dept or 'General'}. "
                     "1. NO TAGS: Never type <function> or technical tags in your final answer. "
                     "2. NO GUESSING: Only use prices from the tool results. Use Rs. only. "
-                    "3. APPOINTMENTS: Always end with: 'I am here for you and I will handle your appointment process personally. I am coordinating with our specialists right now. I will ensure we find the perfect slot together.' "
+                    "3. APPOINTMENTS: Always end with: 'I am here for you and Please click the Appointment Button to proceed with booking. It will guide you through the process quickly and easily.' "
                     "4. TEST LIST: If the user asks for 'all tests' or 'how many', call get_test_info with an empty string. "
                     "5. DATABASE ONLY: Use only doctor names and test prices provided in tool results. Do not hallucinate names"
                     "6. IF EMPTY: If the tool returns an empty list [], you MUST say: 'I'm sorry, I don't have a specialist listed for that in my records yet.' "
