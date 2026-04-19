@@ -3,6 +3,10 @@ from flask_cors import CORS
 import jwt
 import os
 from main import Router
+from report_analyzer import ReportAnalyzer
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = Flask(__name__)
 
@@ -23,6 +27,7 @@ def add_cors_headers(response):
 JWT_SECRET = "your-secret-key-change-in-production-12345"
 
 _routers: dict[str, Router] = {}
+_report_analyzer = ReportAnalyzer(groq_api_key=os.getenv("GROQ_KEY_REPORT"))
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _get_patient_name(auth_header: str) -> str | None:
@@ -84,6 +89,23 @@ def reset():
         _routers[patient_name].close()
         del _routers[patient_name]
     return jsonify({"status": "reset"})
+
+@app.route("/analyze-report", methods=["POST", "OPTIONS"])
+def analyze_report():
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+
+    patient_name = _get_patient_name(request.headers.get("Authorization", ""))
+    if not patient_name:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    file = request.files.get("file")
+    success, status_code, result = _report_analyzer.analyze(file)
+
+    if not success:
+        return jsonify({"error": result}), status_code
+
+    return jsonify({"patient": patient_name, "analysis": result})
 
 if __name__ == "__main__":
     app.run(port=5000, debug=True)
