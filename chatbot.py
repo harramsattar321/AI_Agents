@@ -1,242 +1,187 @@
-import json
+"""
+chatbot.py — HospitalChatbot (General Receptionist)
+====================================================
+No Groq tool-calling API used — too unreliable with llama models.
+
+Instead:
+  1. Keyword detection decides which DB method to call.
+  2. DB results are injected into the LLM prompt as plain context.
+  3. LLM formats a natural language reply from that context.
+
+This is simpler, faster, and never produces broken <function=...> tags.
+"""
+
 import re
 from groq import Groq
 from db import HospitalDB
 
+
 class HospitalChatbot:
-    def __init__(self, mongo_uri, groq_api_key, patient_name):
-        self.client = Groq(api_key=groq_api_key)
-        self.db = HospitalDB(mongo_uri)
+
+    MODEL = "llama-3.3-70b-versatile"
+
+    def __init__(self, mongo_uri: str, groq_api_key: str, patient_name: str):
+        self.client       = Groq(api_key=groq_api_key)
+        self.db           = HospitalDB(mongo_uri)
         self.patient_name = patient_name
-        self.current_dept = None
 
-    def ask(self, query):
-        q_low = query.lower()
+    # ── Public entry point ────────────────────────────────────────────────────
 
-        # ── Department context detection ───────────────────────────────────────
-        if any(x in q_low for x in ["heart", "cardio", "cardiac", "chest pain", "bp", "blood pressure", "heartbeat", "palpitation"]):
-            self.current_dept = "Cardiologist"
-        elif any(x in q_low for x in ["skin", "derm", "rash", "acne", "pimple", "allergy", "itching", "eczema", "psoriasis"]):
-            self.current_dept = "Dermatologist"
-        elif any(x in q_low for x in ["kid", "kids", "child", "children", "baby", "infant", "growth", "vaccination", "fever child"]):
-            self.current_dept = "Pediatrician"
-        elif any(x in q_low for x in ["brain", "neuro", "headache", "migraine", "tremor", "seizure", "epilepsy", "dizziness", "stroke"]):
-            self.current_dept = "Neurologist"
-        elif any(x in q_low for x in ["bone", "joint", "ortho", "fracture", "back pain", "knee pain", "shoulder pain", "arthritis"]):
-            self.current_dept = "Orthopedic Surgeon"
-        elif any(x in q_low for x in ["surgery", "operation", "operate", "cut", "appendix", "hernia", "gallbladder"]):
-            self.current_dept = "General Surgeon"
+    def ask(self, query: str) -> str:
+        # 1. Fetch relevant DB data based on keywords
+        context = self._fetch_context(query)
 
-        # ── If asking about a specific doctor by name, fetch all and let LLM filter ──
-        # This handles "who is Dr. Dawood Khan" / "timings of Dr. X" correctly
-        doctor_name_match = re.search(
-            r'\bdr\.?\s+([a-z]+(?:\s+[a-z]+)?)',
-            q_low
+        # 2. Ask LLM to format a reply using that context
+        return self._generate_reply(query, context)
+
+    # ── Step 1: DB fetch ──────────────────────────────────────────────────────
+
+    def _fetch_context(self, query: str) -> str:
+        q = query.lower()
+
+        # ── Doctor name lookup ("who is Dr. X", "timings of Dr. X") ──────────
+        name_match = re.search(
+            r'\bdr\.?\s+([a-zA-Z]+(?:\s+[a-zA-Z]+){0,2})',
+            query, re.IGNORECASE
+        )
+        if name_match:
+            name = name_match.group(1).strip()
+            doctors = self.db.get_doctors(search_term=name)
+            if doctors:
+                return self._format_doctors(doctors)
+            # Name not found — fall through to specialty search
+
+        # ── Specialty / department keywords ───────────────────────────────────
+        specialty = self._detect_specialty(q)
+        if specialty:
+            doctors = self.db.get_doctors(search_term=specialty)
+            return self._format_doctors(doctors) if doctors else f"No {specialty} found in records."
+
+        # ── General doctor list ───────────────────────────────────────────────
+        if any(x in q for x in [
+            "doctor", "doctors", "specialist", "physician",
+            "who do you have", "available doctor", "list doctor",
+            "how many doctor", "all doctor", "your doctor"
+        ]):
+            doctors = self.db.get_doctors()
+            return self._format_doctors(doctors) if doctors else "No doctors found in records."
+
+        # ── Test / lab pricing ────────────────────────────────────────────────
+        if any(x in q for x in ["test", "lab", "price", "cost", "fee", "cbc", "blood test", "urine", "xray", "x-ray"]):
+            test_name = self._extract_test_name(q)
+            tests = self.db.get_tests(test_name)
+            return self._format_tests(tests) if tests else "No tests found in records."
+
+        # ── Departments ───────────────────────────────────────────────────────
+        if any(x in q for x in ["department", "ward", "unit", "section"]):
+            departments = self.db.get_departments()
+            return self._format_departments(departments) if departments else "No departments found."
+
+        # ── No structured data needed — LLM answers from general knowledge ────
+        return ""
+
+    # ── Step 2: LLM reply ─────────────────────────────────────────────────────
+
+    def _generate_reply(self, query: str, context: str) -> str:
+        if context:
+            context_block = f"\n\nHOSPITAL DATABASE RESULTS:\n{context}\n"
+        else:
+            context_block = ""
+
+        system = (
+            f"You are the empathetic front-desk receptionist at Harram Hospital. "
+            f"Patient name: {self.patient_name}.\n\n"
+            "RULES:\n"
+            "1. Only use information from the HOSPITAL DATABASE RESULTS provided. "
+            "   Never invent doctor names, prices, or timings.\n"
+            "2. If the database result says no records found, tell the patient politely.\n"
+            "3. Use Rs. for all prices.\n"
+            "4. Be warm, helpful, and concise.\n"
+            "5. Never output raw JSON, function tags, or technical syntax.\n"
+            f"{context_block}"
         )
 
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_doctor_info",
-                    "description": (
-                        "Search for doctors by name or specialty. "
-                        "Pass the doctor's name to find a specific doctor. "
-                        "Pass a specialty (e.g. 'Cardiologist') to find doctors in that specialty. "
-                        "Pass an empty string to list all doctors."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "search_term": {
-                                "type": "string",
-                                "description": "Doctor name, specialty, or empty string for all doctors"
-                            }
-                        }
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_available_slots",
-                    "description": (
-                        "Get available time slots for a specific doctor on a specific date. "
-                        "Call when patient asks about doctor availability or free slots."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "doctor_id": {
-                                "type": "integer",
-                                "description": "Doctor ID from get_doctor_info"
-                            },
-                            "appointment_date": {
-                                "type": "string",
-                                "description": "Date in YYYY-MM-DD format"
-                            }
-                        },
-                        "required": ["doctor_id", "appointment_date"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_test_info",
-                    "description": "Get test pricing. Pass empty string to list all tests.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "test_name": {"type": "string"}
-                        }
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_department_info",
-                    "description": "List hospital departments. Pass empty string to list all.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "search_term": {"type": "string"}
-                        }
-                    },
-                },
-            }
-        ]
-
-        system_message = {
-            "role": "system",
-            "content": (
-                f"You are the empathetic front-desk manager at Harram Hospital. Patient: {self.patient_name}. "
-                f"ACTIVE CONTEXT: {self.current_dept or 'General'}. "
-                "RULES: "
-                "1. NO TAGS: Never output <function> tags or raw JSON in your final answer. "
-                "2. NO GUESSING: Only use data from tool results. Use Rs. for prices. "
-                "3. DATABASE ONLY: Only use doctor names from tool results. Never invent names. "
-                "4. IF EMPTY: If tool returns [], say: 'I'm sorry, I don't have that listed in my records yet.' "
-                "5. DOCTOR BY NAME: If asked about a specific doctor (e.g. 'who is Dr. Dawood Khan'), "
-                "   call get_doctor_info with that doctor's name as search_term. "
-                "6. CONTEXT MEMORY: Apply follow-up questions to the last discussed doctor/test."
-            )
-        }
-
         messages = [
-            system_message,
-            {"role": "user", "content": query}
+            {"role": "system", "content": system},
+            {"role": "user",   "content": query},
         ]
-
-        dept_synonyms = {
-            "neuro": "Neurologist", "neurology": "Neurologist", "brain": "Neurologist",
-            "child": "Pediatrician", "kids": "Pediatrician", "baby": "Pediatrician", "pediatric": "Pediatrician",
-            "ortho": "Orthopedic Surgeon", "bone": "Orthopedic Surgeon", "joint": "Orthopedic Surgeon",
-            "skin": "Dermatologist", "derm": "Dermatologist", "rash": "Dermatologist", "acne": "Dermatologist",
-            "surgery": "General Surgeon", "operate": "General Surgeon", "appendix": "General Surgeon",
-            "hernia": "General Surgeon", "gallbladder": "General Surgeon",
-            "heart": "Cardiologist", "cardio": "Cardiologist", "cardiac": "Cardiologist", "chest": "Cardiologist"
-        }
 
         try:
             response = self.client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model=self.MODEL,
                 messages=messages,
-                tools=tools,
-                tool_choice="auto"
+                temperature=0.3,
+                max_tokens=512,
             )
-
-            response_message = response.choices[0].message
-            tool_calls = response_message.tool_calls
-
-            if tool_calls:
-                # Always keep system message + append assistant message with tool calls
-                messages.append(response_message)
-
-                for tool_call in tool_calls:
-                    func_name = tool_call.function.name
-                    args = json.loads(tool_call.function.arguments)
-
-                    if func_name == "get_doctor_info":
-                        raw_val = args.get("search_term", "")
-                        if isinstance(raw_val, dict):
-                            raw_val = ""
-                        else:
-                            raw_val = str(raw_val).strip()
-
-                        if any(x in raw_val.lower() for x in ["all", "list", "every", "full", "show all", "everything"]):
-                            val = ""
-                        else:
-                            # Try synonym map first, then use as-is (handles names + specialties)
-                            synonym_map = {
-                                "heart": "Cardiologist", "cardio": "Cardiologist",
-                                "brain": "Neurologist", "neuro": "Neurologist",
-                                "skin": "Dermatologist", "derm": "Dermatologist",
-                                "child": "Pediatrician", "kids": "Pediatrician", "baby": "Pediatrician",
-                                "bone": "Orthopedic Surgeon", "ortho": "Orthopedic Surgeon",
-                                "surgery": "General Surgeon", "operation": "General Surgeon",
-                                "general physician": "General Physician",
-                            }
-                            val = synonym_map.get(raw_val.lower(), raw_val)
-                        result = self.db.get_doctors(val)
-
-                    elif func_name == "get_test_info":
-                        raw_val = args.get("test_name", "")
-                        if isinstance(raw_val, dict):
-                            raw_val = ""
-                        else:
-                            raw_val = str(raw_val).lower()
-                        val = "" if any(x in raw_val for x in ["all", "list", "every", "full", "show all"]) else raw_val
-                        result = self.db.get_tests(val)
-
-                    elif func_name == "get_available_slots":
-                        result = self.db.get_available_slots(
-                            doctor_id=args.get("doctor_id"),
-                            appointment_date=args.get("appointment_date")
-                        )
-
-                    elif func_name == "get_department_info":
-                        raw_val = args.get("search_term", "")
-                        if isinstance(raw_val, dict):
-                            raw_val = ""
-                        else:
-                            raw_val = str(raw_val).lower()
-                        if any(x in raw_val for x in ["all", "list", "everything", "show all"]):
-                            val = ""
-                        else:
-                            keywords = [k for k in re.split(r"\s+", raw_val) if len(k) > 2]
-                            val = {"$or": []}
-                            for kw in keywords:
-                                dept_name = dept_synonyms.get(kw, kw)
-                                val["$or"].append({"name": {"$regex": re.escape(dept_name), "$options": "i"}})
-                            if not val["$or"]:
-                                val = {}
-                        result = self.db.get_departments(val)
-
-                    else:
-                        result = []
-
-                    messages.append({
-                        "role":         "tool",
-                        "tool_call_id": tool_call.id,
-                        "content":      json.dumps(result, default=str)
-                    })
-
-                # ── Final call: always include system message at index 0 ────────
-                # Never slice off the system message — keep [system, assistant+tools, tool_results]
-                final_messages = [system_message] + messages[1:]
-
-                final_res = self.client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=final_messages
-                )
-                raw_answer = final_res.choices[0].message.content
-
-            else:
-                raw_answer = response_message.content
-
-            return re.sub(r'<function=.*?>|<[^>]+>', '', raw_answer).strip()
-
+            raw = response.choices[0].message.content or ""
+            return re.sub(r'<[^>]+>', '', raw).strip()
         except Exception as e:
-            return f"I am here for you, but I encountered a slight error. Let's try again! ({str(e)})"
+            return f"I'm sorry, I encountered an error. Please try again. ({e})"
+
+    # ── Specialty detector ────────────────────────────────────────────────────
+
+    def _detect_specialty(self, q: str) -> str:
+        mapping = [
+            (["cardiolog", "heart", "cardio", "cardiac", "chest pain", "palpitation", "blood pressure"], "Cardiologist"),
+            (["neurolog", "brain", "neuro", "headache", "migraine", "seizure", "epilepsy", "stroke", "dizziness"], "Neurologist"),
+            (["pediatric", "child", "kids", "baby", "infant", "vaccination"], "Pediatrician"),
+            (["dermatolog", "skin", "derm", "rash", "acne", "eczema", "psoriasis", "itching"], "Dermatologist"),
+            (["orthopedic", "ortho", "bone", "joint", "fracture", "back pain", "knee", "shoulder", "arthritis"], "Orthopedic Surgeon"),
+            (["general surgeon", "surgery", "operation", "appendix", "hernia", "gallbladder"], "General Surgeon"),
+            (["general physician", "general doctor", "gp", "hematolog", "blood doctor", "anemia"], "General Physician"),
+            (["psychiatr", "mental", "psycholog", "anxiety", "depression"], "Psychiatrist"),
+            (["gynecolog", "obstetr", "women", "pregnancy", "maternity"], "Gynecologist"),
+        ]
+        for keywords, specialty in mapping:
+            if any(kw in q for kw in keywords):
+                return specialty
+        return ""
+
+    def _extract_test_name(self, q: str) -> str:
+        known = ["cbc", "complete blood count", "urine", "urine analysis", "xray", "x-ray",
+                 "mri", "ct scan", "ultrasound", "ecg", "blood sugar", "glucose", "cholesterol",
+                 "liver function", "kidney function", "thyroid", "hepatitis"]
+        for t in known:
+            if t in q:
+                return t
+        return ""
+
+    # ── Context formatters ────────────────────────────────────────────────────
+
+    def _format_doctors(self, doctors: list) -> str:
+        if not doctors:
+            return "No doctors found."
+        lines = []
+        for d in doctors:
+            name       = d.get("name", "N/A")
+            specialty  = d.get("specialty", "")
+            dept       = d.get("department", "")
+            timings    = d.get("timings", "") or d.get("schedule", "")
+            experience = d.get("experience", "")
+            fee        = d.get("fee", "") or d.get("consultationFee", "")
+
+            line = f"- Dr. {name}"
+            if specialty:  line += f" | Specialty: {specialty}"
+            if dept:       line += f" | Dept: {dept}"
+            if timings:    line += f" | Timings: {timings}"
+            if experience: line += f" | Experience: {experience} years"
+            if fee:        line += f" | Fee: Rs. {fee}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _format_tests(self, tests: list) -> str:
+        if not tests:
+            return "No tests found."
+        lines = []
+        for t in tests:
+            name  = t.get("name", "N/A")
+            price = t.get("price", "") or t.get("fee", "")
+            line  = f"- {name}"
+            if price: line += f": Rs. {price}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _format_departments(self, departments: list) -> str:
+        if not departments:
+            return "No departments found."
+        return "\n".join(f"- {d.get('name', 'N/A')}" for d in departments)
