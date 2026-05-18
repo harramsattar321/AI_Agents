@@ -15,14 +15,20 @@ load_dotenv()
 app = Flask(__name__)
 
 CORS(app,
-     origins=["http://localhost:4200"],
+     origins=["http://localhost:4200", "https://ambitious-wave-0575e9603.7.azurestaticapps.net"],
      allow_headers=["Authorization", "Content-Type"],
      methods=["GET", "POST", "OPTIONS"],
      supports_credentials=True)
 
+ALLOWED_ORIGINS = [
+    "http://localhost:4200",
+    "https://ambitious-wave-0575e9603.7.azurestaticapps.net"
+]
 @app.after_request
 def add_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"]  = "http://localhost:4200"
+    origin = request.headers.get("Origin", "")
+    if origin in ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"]  = origin
     response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return response
