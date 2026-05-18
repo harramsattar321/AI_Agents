@@ -1,40 +1,44 @@
 """
-main.py — The Router
-====================
-Three-agent orchestration layer for Harram Hospital AI Assistant.
+main.py — Invisible LLM Router
+===============================
+One LLM call per message decides which agent handles the turn.
+No explicit state machine. No "exit report" commands. No mode labels.
+
+The user just talks. The router reads conversation history + session context
+and silently picks the right agent every single turn.
 
 Agents:
-  Agent 1 — HospitalChatbot   (chatbot.py)         General receptionist
-  Agent 2 — BookingAgent      (booking_agent.py)   Appointment booking
-  Agent 3 — InsuranceAgent    (insurance_agent.py) Insurance / coverage queries
-  Agent 4 — ReportChatter     (report_chatter.py)  Medical report Q&A
+  HospitalChatbot   (chatbot.py)         — general receptionist
+  BookingAgent      (booking_agent.py)   — appointment booking
+  InsuranceAgent    (insurance_agent.py) — insurance / coverage
+  ReportChatter     (report_chatter.py)  — medical report Q&A
 
-State machine:
-    CHAT      ──(booking intent)──►   BOOKING   ──(terminal)──► CHAT
-    CHAT      ──(insurance intent)──► INSURANCE ──(done/exit)──► CHAT
-    CHAT      ──(report loaded)────► REPORT    ──(exit report)──► CHAT
-    BOOKING   ──(insurance intent)──► INSURANCE
-    BOOKING   ──(general intent)───►  CHAT
-    INSURANCE ──(booking intent)───►  BOOKING
-    INSURANCE ──(general intent)───►  CHAT
+Routing signals (returned by LLM as JSON):
+  {"route": "chat"}      — general hospital question
+  {"route": "report"}    — question about the loaded report
+  {"route": "insurance"} — insurance / coverage question
+  {"route": "booking"}   — appointment booking intent
 """
 
 import re
 import os
 import io
+import json
 import pdfplumber
+import requests
 
-from chatbot         import HospitalChatbot    # Agent 1
-from booking_agent   import BookingAgent       # Agent 2
-from insurance_agent import InsuranceAgent     # Agent 3
-from report_chatter  import ReportChatter      # Agent 4
-from report_analyzer import ReportAnalyzer     # PDF summarizer
+from chatbot         import HospitalChatbot
+from booking_agent   import BookingAgent
+from insurance_agent import InsuranceAgent
+from report_chatter  import ReportChatter
+from report_analyzer import ReportAnalyzer
 from db              import HospitalDB
 from dotenv import load_dotenv
+
 load_dotenv()
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  CONFIGURATION
+#  CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 MONGO_URI     = os.getenv("MONGO_URI")
 GROQ_KEY_CHAT = os.getenv("GROQ_KEY_CHAT")
@@ -42,92 +46,47 @@ GROQ_KEY_BOOK = os.getenv("GROQ_KEY_BOOK")
 GROQ_KEY_INS  = os.getenv("GROQ_KEY_INS")
 GROQ_KEY_RPT  = os.getenv("GROQ_KEY_REPORT")
 
+GROQ_API_URL  = "https://api.groq.com/openai/v1/chat/completions"
+ROUTER_MODEL  = "llama-3.3-70b-versatile"
+
 # ─────────────────────────────────────────────────────────────────────────────
-#  INTENT DETECTORS
+#  ROUTER SYSTEM PROMPT
+# ─────────────────────────────────────────────────────────────────────────────
+_ROUTER_SYSTEM = """You are a silent routing assistant for a hospital AI chatbot.
+Your ONLY job is to read the conversation and decide which agent should handle
+the latest patient message. Reply with ONLY a JSON object — nothing else.
+
+AGENTS:
+  "chat"      — General hospital questions: doctors, timings, fees, departments,
+                lab tests, hospital info, greetings, anything not covered below.
+  "report"    — Questions about the patient's uploaded medical report: values,
+                what's abnormal, severity, what a result means, which doctor to
+                see based on the report findings.
+  "insurance" — Insurance, coverage, claims, health plans, panel hospitals,
+                policy, co-pay, reimbursement.
+  "booking"   — Booking, scheduling, or reserving a new appointment with a doctor.
+
+RULES:
+  1. If no report has been uploaded, NEVER route to "report".
+  2. "book", "schedule", "appointment" → "booking".
+  3. Insurance keywords → "insurance".
+  4. If the patient is mid-conversation with one agent and asks a follow-up
+     that clearly belongs there, keep routing to that agent.
+  5. When in doubt → "chat".
+  6. Output ONLY: {{"route": "<agent>"}}  — no explanation, no other keys.
+
+REPORT LOADED: {report_loaded}
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CANCEL / BOOKING TERMINAL HELPERS  (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 _CANCEL_BOOKING_RE = re.compile(
-    r"\b(cancel appointment|cancel my appointment|reschedule|re.?schedule|change appointment|reappointment)\b",
-    re.IGNORECASE
+    r"\b(cancel appointment|cancel my appointment|reschedule|re.?schedule"
+    r"|change appointment|reappointment)\b",
+    re.IGNORECASE,
 )
 
-_BOOKING_RE = re.compile(
-    r"\b("
-    r"book|appointment|appoint|schedule|reserve"
-    r"|fix an? appoint"
-    r"|book me|make an? appoint|set up an? appoint"
-    r"|visit the doctor"
-    r")\b",
-    re.IGNORECASE
-)
-
-_ADVISORY_RE = re.compile(
-    r"\b("
-    r"whom (?:should|do|to|can|must) i (?:consult|see|visit|go to|contact)"
-    r"|who (?:should|can|do) i (?:consult|see|visit)"
-    r"|which doctor"
-    r"|what (?:doctor|specialist|department)"
-    r"|i want to (?:know|find|ask about) (?:a |the )?doctor"
-    r"|recommend (?:a |the )?doctor"
-    r"|suggest (?:a |the )?doctor"
-    r"|consult(?:ation)?"
-    r"|i (?:need|want) to see(?: a)?(?: doctor)?"
-    r")\b",
-    re.IGNORECASE
-)
-
-_INSURANCE_RE = re.compile(
-    r"\b("
-    r"insur(?:ance|ed|er)?|coverage|cover|claim"
-    r"|efu|jubilee|adamjee|state life"
-    r"|cashless|panel|in.?network|out.?of.?network"
-    r"|policy|policies|premium|deductible|co.?pay"
-    r"|reimburs(?:e|ement)|health.?plan|health plan"
-    r"|sehat|rahbar|mukammal|lifestyle care|personal health"
-    r"|admission fee|file fee"
-    r")\b",
-    re.IGNORECASE
-)
-
-_GENERAL_RE = re.compile(
-    r"\b("
-    r"hospital|clinic|harram"
-    r"|timings?|hours?|opening|closing|open"
-    r"|location|address|directions?|where (?:is|are)"
-    r"|facilities|services|departments?"
-    r"|doctors? list|staff|specialists?"
-    r"|emergency|ward|icu|lab(?:oratory)?|pharmacy"
-    r"|parking|visiting hours?|contact|phone|number"
-    r"|something else|other question|different question"
-    r"|general query|general question|main menu|receptionist"
-    r"|go back to|take me back|return to"
-    r"|forget (?:the )?(?:booking|insurance|it)"
-    r"|not about (?:booking|insurance|appointment)"
-    r"|tell me about (?:the )?hospital"
-    r"|info(?:rmation)? about"
-    r"|what (?:do you offer|can you do|are the)"
-    r")\b",
-    re.IGNORECASE
-)
-
-def _is_booking_intent(text: str) -> bool:
-    return bool(_BOOKING_RE.search(text)) and not bool(_ADVISORY_RE.search(text))
-
-def _is_insurance_intent(text: str) -> bool:
-    return bool(_INSURANCE_RE.search(text))
-
-def _is_general_intent(text: str) -> bool:
-    return (
-        bool(_GENERAL_RE.search(text))
-        and not _is_booking_intent(text)
-        and not _is_insurance_intent(text)
-    )
-
-def _is_cancel_or_reschedule(text: str) -> bool:
-    return bool(_CANCEL_BOOKING_RE.search(text))
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  TERMINAL SIGNAL HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
 def _format_booking_terminal(reply: str, patient_name: str) -> str:
     if reply.startswith("BOOKING_COMPLETE"):
         detail = reply.replace("BOOKING_COMPLETE:", "").strip()
@@ -142,39 +101,34 @@ def _format_booking_terminal(reply: str, patient_name: str) -> str:
         )
     return reply
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-#  ROUTER
+#  ROUTER CLASS
 # ─────────────────────────────────────────────────────────────────────────────
 class Router:
 
-    CHAT      = "CHAT"
-    BOOKING   = "BOOKING"
-    INSURANCE = "INSURANCE"
-    REPORT    = "REPORT"
-
     def __init__(self, patient_name: str):
         self.patient_name = patient_name
-        self.state        = self.CHAT
 
         self.db = HospitalDB(MONGO_URI)
 
         self.chat_agent = HospitalChatbot(
             mongo_uri    = MONGO_URI,
             groq_api_key = GROQ_KEY_CHAT,
-            patient_name = patient_name
+            patient_name = patient_name,
         )
         self.chat_agent.db = self.db
 
         self.booking_agent = BookingAgent(
             groq_api_key_2 = GROQ_KEY_BOOK,
             db             = self.db,
-            patient_name   = patient_name
+            patient_name   = patient_name,
         )
 
         self.insurance_agent = InsuranceAgent(
             groq_api_key = GROQ_KEY_INS,
             mongo_uri    = MONGO_URI,
-            patient_name = patient_name
+            patient_name = patient_name,
         )
 
         self.report_chatter = ReportChatter(
@@ -186,26 +140,81 @@ class Router:
 
         self.report_analyzer = ReportAnalyzer(groq_api_key=GROQ_KEY_RPT)
 
-        # Report session state
+        # Report context — loaded once, lives for the whole session
         self._report_text:    str        = ""
         self._report_history: list[dict] = []
 
-        self.display_history: list[dict] = []
+        # Full conversation history for the router LLM
+        self._history: list[dict] = []
 
-    # ── Cancel shortcut ───────────────────────────────────────────────────────
-    _CANCEL_RE = re.compile(
-        r"\b(cancel|stop|quit|exit|never ?mind|forget it|go back|main menu)\b",
-        re.IGNORECASE
-    )
+        # Track last route so booking/insurance agents retain context
+        self._last_route: str = "chat"
 
-    def _wants_to_cancel(self, text: str) -> bool:
-        return bool(self._CANCEL_RE.search(text))
+    # ── Report loaded? ────────────────────────────────────────────────────────
+    @property
+    def has_report(self) -> bool:
+        return bool(self._report_text)
 
-    # ── Load a PDF report ─────────────────────────────────────────────────────
+    # ── LLM Router ────────────────────────────────────────────────────────────
+    def _route(self, user_input: str) -> str:
+        """
+        Ask the router LLM which agent should handle this message.
+        Returns one of: "chat", "report", "insurance", "booking".
+        Falls back to "chat" on any error.
+        """
+        system = _ROUTER_SYSTEM.format(
+            report_loaded="YES" if self.has_report else "NO"
+        )
+
+        # Give the router the last 10 turns for context (enough, not too expensive)
+        recent_history = self._history[-10:]
+
+        messages = [{"role": "system", "content": system}]
+        messages.extend(recent_history)
+        messages.append({"role": "user", "content": user_input})
+
+        try:
+            response = requests.post(
+                GROQ_API_URL,
+                headers={
+                    "Authorization": f"Bearer {GROQ_KEY_CHAT}",
+                    "Content-Type":  "application/json",
+                },
+                json={
+                    "model":       ROUTER_MODEL,
+                    "messages":    messages,
+                    "temperature": 0.0,   # deterministic routing
+                    "max_tokens":  20,    # {"route": "chat"} is only ~10 tokens
+                },
+                timeout=10,
+            )
+            response.raise_for_status()
+            raw = response.json()["choices"][0]["message"]["content"].strip()
+
+            # Parse JSON signal
+            clean = re.sub(r"```(?:json)?|```", "", raw).strip()
+            data  = json.loads(clean)
+            route = data.get("route", "chat").lower()
+
+            # Validate
+            if route not in ("chat", "report", "insurance", "booking"):
+                route = "chat"
+
+            # Never route to report if no report is loaded
+            if route == "report" and not self.has_report:
+                route = "chat"
+
+            return route
+
+        except Exception as e:
+            print(f"[Router fallback] {e}")
+            return self._last_route  # safe: stay on last known agent
+
+    # ── Load PDF report ───────────────────────────────────────────────────────
     def load_report(self, pdf_path: str) -> str:
         """
-        Analyze a PDF file, print the summary, and switch to REPORT state.
-        Returns the summary string.
+        Analyze a PDF, store extracted text, return formatted summary string.
+        Report context persists for the whole session.
         """
         if not os.path.isfile(pdf_path):
             return f"❌ File not found: {pdf_path}"
@@ -213,7 +222,6 @@ class Router:
         with open(pdf_path, "rb") as f:
             file_bytes = f.read()
 
-        # Extract text
         try:
             with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
                 self._report_text = "\n".join(
@@ -225,29 +233,25 @@ class Router:
         if not self._report_text:
             return "❌ Could not extract text from this PDF (may be a scanned image)."
 
-        # Summarize
         print("⏳ Analyzing report...")
 
         class _FakeFile:
-            """Wraps raw bytes to look like a Flask file upload."""
             def __init__(self, data, name):
                 self.filename = name
-                self._data    = data
                 self._stream  = io.BytesIO(data)
-            def read(self):   return self._stream.read()
+            def read(self):    return self._stream.read()
             def seek(self, n): self._stream.seek(n)
 
         fake_file = _FakeFile(file_bytes, os.path.basename(pdf_path))
         success, _, result = self.report_analyzer.analyze(fake_file)
 
         if not success:
+            self._report_text = ""   # rollback — don't route to report
             return f"❌ Analysis failed: {result}"
 
-        # Switch to REPORT state
-        self.state = self.REPORT
+        # Reset report Q&A history (new report = fresh conversation)
         self._report_history = []
 
-        # Format summary for terminal
         lines = [
             "",
             "═" * 56,
@@ -256,7 +260,21 @@ class Router:
             f"  Type    : {result.get('report_type', 'Unknown')}",
             f"  Summary : {result.get('summary', '')}",
         ]
+        for v in result.get("abnormal_values", []):
+            lines.append(
+                f"     • {v['name']}: {v['value']} "
+                f"(normal: {v['normal_range']}) [{v['status']}]"
+            ) if lines.count("\n  ⚠️  Abnormal Values:") == 0 else None
 
+        # Rebuild properly
+        lines = [
+            "",
+            "═" * 56,
+            "  📋  REPORT ANALYSIS",
+            "═" * 56,
+            f"  Type    : {result.get('report_type', 'Unknown')}",
+            f"  Summary : {result.get('summary', '')}",
+        ]
         abnormal = result.get("abnormal_values", [])
         if abnormal:
             lines.append("\n  ⚠️  Abnormal Values:")
@@ -265,190 +283,91 @@ class Router:
                     f"     • {v['name']}: {v['value']} "
                     f"(normal: {v['normal_range']}) [{v['status']}]"
                 )
-
         observations = result.get("key_observations", [])
         if observations:
             lines.append("\n  🔍  Key Observations:")
             for obs in observations:
                 lines.append(f"     • {obs}")
-
         advice = result.get("advice", "")
         if advice:
             lines.append(f"\n  💡  Advice : {advice}")
-
         lines += [
             "",
             f"  {result.get('disclaimer', '')}",
             "═" * 56,
             "",
-            "  You are now in REPORT mode.",
-            "  Ask me anything about this report.",
-            "  Type 'exit report' to return to general chat.",
+            "  ✅  Report loaded. Ask me anything about it,",
+            "  or continue with any other hospital questions.",
             "═" * 56,
         ]
-
         return "\n".join(lines)
 
-    # ── Single turn dispatcher ────────────────────────────────────────────────
+    # ── Single turn handler ───────────────────────────────────────────────────
     def handle(self, user_input: str) -> str:
-        if len(self.display_history) > 40:
-            self.display_history = self.display_history[-40:]
+        # Keep history bounded
+        if len(self._history) > 40:
+            self._history = self._history[-40:]
 
-        self.display_history.append({"role": "user", "content": user_input})
-
-        # ── Universal cancel ──────────────────────────────────────────────────
-        if self.state != self.CHAT and self._wants_to_cancel(user_input):
-            self.state = self.CHAT
+        # ── Cancel/reschedule shortcut (always goes to chat) ──────────────────
+        if _CANCEL_BOOKING_RE.search(user_input):
             self.booking_agent.reset()
-            self.insurance_agent.reset()
-            self._report_text    = ""
-            self._report_history = []
             reply = (
-                f"No problem, {self.patient_name}. "
-                f"I'm back as your general receptionist — how can I help you?"
+                "\n" + "═" * 50 + "\n"
+                "        🔄  MANAGE YOUR APPOINTMENT\n"
+                + "═" * 50 + "\n\n"
+                " Please click the 'Appointment Button'\n"
+                " to open the Appointment Management page.\n\n"
+                " There you can:\n"
+                "   • Cancel Appointment\n"
+                "   • Re-schedule Appointment\n\n"
+                " Quick • Simple • Hassle-Free\n\n"
+                f"Need anything else, {self.patient_name}?\n"
             )
-            self.display_history.append({"role": "assistant", "content": reply})
+            self._record(user_input, reply)
             return reply
 
-        # ══════════════════════════════════════════════════════════════════════
-        #  STATE: REPORT
-        # ══════════════════════════════════════════════════════════════════════
-        if self.state == self.REPORT:
+        # ── LLM decides the route ─────────────────────────────────────────────
+        route = self._route(user_input)
+        self._last_route = route
 
-            # Exit report mode explicitly
-            if re.search(r"\b(exit report|leave report|done with report|back to chat)\b",
-                         user_input, re.IGNORECASE):
-                self.state           = self.CHAT
-                self._report_text    = ""
-                self._report_history = []
-                reply = (
-                    f"You've exited report mode, {self.patient_name}. "
-                    f"I'm back as your general receptionist — how can I help you?"
-                )
+        # ── Dispatch ──────────────────────────────────────────────────────────
+        if route == "booking":
+            reply = self._handle_booking(user_input)
 
-            else:
-                reply = self.report_chatter.chat(
-                    report_text  = self._report_text,
-                    question     = user_input,
-                    history      = self._report_history,
-                    patient_name = self.patient_name,
-                )
-                # Update report conversation history
-                self._report_history.append({"role": "user",      "content": user_input})
-                self._report_history.append({"role": "assistant",  "content": reply})
-                if len(self._report_history) > 12:
-                    self._report_history = self._report_history[-12:]
+        elif route == "insurance":
+            reply = self.insurance_agent.respond(user_input)
 
-        # ══════════════════════════════════════════════════════════════════════
-        #  STATE: CHAT
-        # ══════════════════════════════════════════════════════════════════════
-        elif self.state == self.CHAT:
+        elif route == "report":
+            reply = self.report_chatter.chat(
+                report_text  = self._report_text,
+                question     = user_input,
+                history      = self._report_history,
+                patient_name = self.patient_name,
+            )
+            # Update report-specific history
+            self._report_history.append({"role": "user",      "content": user_input})
+            self._report_history.append({"role": "assistant",  "content": reply})
+            if len(self._report_history) > 12:
+                self._report_history = self._report_history[-12:]
 
-            if _is_cancel_or_reschedule(user_input):
-                reply = (
-                    "\n" + "═" * 50 + "\n"
-                    "        🔄  MANAGE YOUR APPOINTMENT\n"
-                    + "═" * 50 + "\n\n"
-                    " Please click the 'Appointment Button'\n"
-                    " to open the Appointment Management page.\n\n"
-                    " There you can:\n"
-                    "   • Cancel Appointment\n"
-                    "   • Re-schedule Appointment\n\n"
-                    " Quick • Simple • Hassle-Free\n\n"
-                    f"Need anything else, {self.patient_name}?\n"
-                )
-
-            elif _is_booking_intent(user_input):
-                reply = (
-                    "\n" + "═" * 50 + "\n"
-                    "            APPOINTMENT BOOKING\n"
-                    + "═" * 50 + "\n\n"
-                    "Please click the 'Appointment Button' to begin.\n\n"
-                    "Follow these simple steps:\n"
-                    "   1️⃣ Select your preferred doctor\n"
-                    "   2️⃣ Choose a suitable date\n"
-                    "   3️⃣ Pick an available time slot\n"
-                    "   4️⃣ Click 'Confirm Appointment'\n\n"
-                    " Your appointment will be successfully scheduled.\n\n"
-                    "⚡ Fast • Easy • Secure\n\n"
-                    f"How else can I assist you, {self.patient_name}?\n"
-                )
-
-            elif _is_insurance_intent(user_input):
-                self.state = self.INSURANCE
-                self.insurance_agent.reset()
-                reply = self.insurance_agent.respond(user_input)
-
-            else:
-                reply = self.chat_agent.ask(user_input)
-
-        # ══════════════════════════════════════════════════════════════════════
-        #  STATE: BOOKING
-        # ══════════════════════════════════════════════════════════════════════
-        elif self.state == self.BOOKING:
-
-            if _is_general_intent(user_input):
-                self.state = self.CHAT
-                self.booking_agent.reset()
-                reply = self.chat_agent.ask(user_input)
-
-            elif _is_insurance_intent(user_input):
-                self.state = self.INSURANCE
-                self.booking_agent.reset()
-                reply = self.insurance_agent.respond(user_input)
-
-            else:
-                booking_reply, is_terminal = self.booking_agent.respond(user_input)
-                reply = self._wrap_booking(booking_reply, is_terminal)
-
-        # ══════════════════════════════════════════════════════════════════════
-        #  STATE: INSURANCE
-        # ══════════════════════════════════════════════════════════════════════
-        elif self.state == self.INSURANCE:
-
-            if _is_general_intent(user_input):
-                self.state = self.CHAT
-                self.insurance_agent.reset()
-                reply = self.chat_agent.ask(user_input)
-
-            elif _is_booking_intent(user_input):
-                self.state = self.BOOKING
-                self.booking_agent.reset()
-                booking_reply, is_terminal = self.booking_agent.respond(user_input)
-                reply = (
-                    booking_reply
-                    if not is_terminal
-                    else self._wrap_booking(booking_reply, is_terminal)
-                )
-
-            else:
-                ins_reply = self.insurance_agent.respond(user_input)
-                if re.search(
-                    r"\b(thank(?:s| you)|that'?s? all|no more questions?|got it|perfect|great|bye)\b",
-                    user_input, re.IGNORECASE
-                ):
-                    self.state = self.CHAT
-                    self.insurance_agent.reset()
-                    reply = (
-                        f"{ins_reply}\n\n"
-                        f"Feel free to ask me anything else, {self.patient_name}! "
-                        f"I'm back as your general receptionist."
-                    )
-                else:
-                    reply = ins_reply
-
-        else:
+        else:  # "chat"
             reply = self.chat_agent.ask(user_input)
 
-        self.display_history.append({"role": "assistant", "content": reply})
+        self._record(user_input, reply)
         return reply
 
-    def _wrap_booking(self, reply: str, is_terminal: bool) -> str:
+    # ── Booking sub-handler ───────────────────────────────────────────────────
+    def _handle_booking(self, user_input: str) -> str:
+        booking_reply, is_terminal = self.booking_agent.respond(user_input)
         if is_terminal:
-            self.state = self.CHAT
             self.booking_agent.reset()
-            return _format_booking_terminal(reply, self.patient_name)
-        return reply
+            return _format_booking_terminal(booking_reply, self.patient_name)
+        return booking_reply
+
+    # ── History recorder ──────────────────────────────────────────────────────
+    def _record(self, user_input: str, reply: str):
+        self._history.append({"role": "user",      "content": user_input})
+        self._history.append({"role": "assistant",  "content": reply})
 
     def close(self):
         self.db.close()
@@ -470,26 +389,17 @@ def main():
     router = Router(patient_name=name)
 
     print(f"\nWelcome, {name}! I'm your hospital assistant.")
-    print("I can help with general queries, appointments, and insurance.")
+    print("I can help with general queries, appointments, insurance, and medical reports.")
     print("\nCommands:")
-    print("  Type a message       → chat normally")
-    print("  /report <path>       → upload and analyze a PDF report")
-    print("                         e.g.  /report CBC_Test.pdf")
-    print("  exit report          → leave report mode, return to general chat")
-    print("  exit / quit / bye    → quit the program")
+    print("  Type a message     → chat normally")
+    print("  /report <path>     → upload and analyze a PDF report")
+    print("                       e.g.  /report CBC_Test.pdf")
+    print("  exit / quit / bye  → quit")
     print("─" * 56)
-
-    _STATE_LABELS = {
-        Router.CHAT:      "[CHAT]     ",
-        Router.BOOKING:   "[BOOKING]  ",
-        Router.INSURANCE: "[INSURANCE]",
-        Router.REPORT:    "[REPORT]   ",
-    }
 
     try:
         while True:
-            tag        = _STATE_LABELS.get(router.state, "[CHAT]     ")
-            user_input = input(f"\n{tag} {name} > ").strip()
+            user_input = input(f"\n{name} > ").strip()
 
             if not user_input:
                 continue
@@ -498,7 +408,7 @@ def main():
                 print(f"\nGoodbye, {name}! Stay healthy. 👋")
                 break
 
-            # ── /report <path> command ────────────────────────────────────────
+            # ── /report <path> ────────────────────────────────────────────────
             if user_input.lower().startswith("/report"):
                 parts    = user_input.split(maxsplit=1)
                 pdf_path = parts[1].strip() if len(parts) > 1 else ""
@@ -506,6 +416,7 @@ def main():
                     print("Usage: /report <path to PDF file>")
                     print("Example: /report CBC_Test.pdf")
                     continue
+                print("⏳ Analyzing report...")
                 summary = router.load_report(pdf_path)
                 print(f"\n{summary}")
                 continue
