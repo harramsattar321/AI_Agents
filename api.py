@@ -136,7 +136,17 @@ def chat():
         return jsonify({"error": "Empty message"}), 400
 
     router = _get_router(patient_id)
-    reply  = router.handle(user_input)
+
+    # Update display name from request body if provided
+    # Session key stays as JWT userId — this is for greeting only
+    display_name = (data or {}).get("patientName", "").strip()
+    if display_name:
+        router.patient_name                  = display_name
+        router.chat_agent.patient_name       = display_name
+        router.booking_agent.patient_name    = display_name
+        router.insurance_agent.patient_name  = display_name
+
+    reply = router.handle(user_input)
 
     return jsonify({
         "reply":      reply,
@@ -176,8 +186,16 @@ def analyze_report():
     router._report_text    = report_text
     router._report_history = []
 
+    # Store display name if frontend sent patientName in form data
+    display_name = request.form.get("patientName", "").strip()
+    if display_name:
+        router.patient_name                  = display_name
+        router.chat_agent.patient_name       = display_name
+        router.booking_agent.patient_name    = display_name
+        router.insurance_agent.patient_name  = display_name
+
     return jsonify({
-        "patient":    patient_id,
+        "patient":    display_name or patient_id,
         "analysis":   result,
         "has_report": True,
     })
