@@ -139,11 +139,11 @@ def chat():
 
     # Update display name from request body if provided
     # Session key stays as JWT userId — this is for greeting only
+    # booking_agent.patient_name is NEVER updated — it stores patient ID to DB
     display_name = (data or {}).get("patientName", "").strip()
     if display_name:
         router.patient_name                  = display_name
         router.chat_agent.patient_name       = display_name
-        router.booking_agent.patient_name    = display_name
         router.insurance_agent.patient_name  = display_name
 
     reply = router.handle(user_input)
@@ -187,11 +187,11 @@ def analyze_report():
     router._report_history = []
 
     # Store display name if frontend sent patientName in form data
+    # booking_agent.patient_name is NEVER updated — it stores patient ID to DB
     display_name = request.form.get("patientName", "").strip()
     if display_name:
         router.patient_name                  = display_name
         router.chat_agent.patient_name       = display_name
-        router.booking_agent.patient_name    = display_name
         router.insurance_agent.patient_name  = display_name
 
     return jsonify({
