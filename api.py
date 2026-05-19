@@ -1,15 +1,14 @@
 """
-app.py — Flask API
+api.py — Flask API
 ==================
 One /chat endpoint for everything.
 The Router in main.py uses an LLM to decide per-message which agent handles
 the turn — general chat, report Q&A, insurance, or booking — invisibly.
 
-Frontend changes needed:
-  • Send ALL messages (including report questions) to POST /chat
-  • POST /analyze-report to upload a PDF; the router auto-enables report routing
-  • /chat-report, /clear-report are kept as stubs for backwards compatibility
-    but are no longer the primary path
+KEY FIX: Router is always keyed on JWT userId (patient_name from token).
+The patientName field from the request body is used only for display/greeting —
+never as the session key. This ensures /analyze-report and /chat always
+hit the same router instance regardless of what the frontend sends in the body.
 """
 
 from flask import Flask, request, jsonify
@@ -60,14 +59,19 @@ MONGO_URI  = os.getenv("MONGO_URI")
 _db              = HospitalDB(uri=MONGO_URI)
 _report_analyzer = ReportAnalyzer(groq_api_key=os.getenv("GROQ_KEY_REPORT"))
 
-# One Router instance per patient — holds all agent state + report context
+# One Router instance per patient — keyed on JWT userId, never display name
 _routers: dict[str, Router] = {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  AUTH HELPER
 # ─────────────────────────────────────────────────────────────────────────────
-def _get_patient_name(auth_header: str) -> str | None:
+def _get_patient_id(auth_header: str) -> str | None:
+    """
+    Extract patient ID from JWT token.
+    Returns userId (e.g. PAT1776188487656870) or email as fallback.
+    This is the single source of truth for session keying.
+    """
     if not auth_header or not auth_header.startswith("Bearer "):
         print("❌ No auth header or wrong format")
         return None
@@ -83,10 +87,11 @@ def _get_patient_name(auth_header: str) -> str | None:
         return None
 
 
-def _get_router(display_name: str) -> Router:
-    if display_name not in _routers:
-        _routers[display_name] = Router(patient_name=display_name)
-    return _routers[display_name]
+def _get_router(patient_id: str) -> Router:
+    """Always keyed on JWT userId — never on display name."""
+    if patient_id not in _routers:
+        _routers[patient_id] = Router(patient_name=patient_id)
+    return _routers[patient_id]
 
 
 def _extract_text_from_pdf(file_bytes: bytes) -> str:
@@ -112,9 +117,6 @@ def debug():
 
 
 # ── /chat — unified endpoint for ALL messages ─────────────────────────────────
-# The router decides per-turn whether this is a general question, report Q&A,
-# insurance, or booking. The frontend does NOT need to track mode.
-#
 # Request:  {"message": "...", "patientName": "..."}
 # Response: {"reply": "...", "has_report": true/false}
 
@@ -123,30 +125,26 @@ def chat():
     if request.method == "OPTIONS":
         return jsonify({}), 200
 
-    patient_name = _get_patient_name(request.headers.get("Authorization", ""))
-    if not patient_name:
+    patient_id = _get_patient_id(request.headers.get("Authorization", ""))
+    if not patient_id:
         return jsonify({"error": "Unauthorized"}), 401
 
-    data         = request.get_json()
-    user_input   = (data or {}).get("message", "").strip()
-    display_name = (data or {}).get("patientName", patient_name)
+    data       = request.get_json()
+    user_input = (data or {}).get("message", "").strip()
 
     if not user_input:
         return jsonify({"error": "Empty message"}), 400
 
-    router = _get_router(display_name)
+    router = _get_router(patient_id)
     reply  = router.handle(user_input)
 
     return jsonify({
         "reply":      reply,
-        "has_report": router.has_report,   # frontend can show/hide report badge
+        "has_report": router.has_report,
     })
 
 
 # ── /analyze-report — upload PDF, store in router session ────────────────────
-# After this call succeeds, /chat will automatically route report questions
-# to the report agent. No mode switching needed on the frontend.
-#
 # Request:  multipart/form-data with "file" field
 # Response: {"patient": ..., "analysis": ..., "has_report": true}
 
@@ -155,12 +153,9 @@ def analyze_report():
     if request.method == "OPTIONS":
         return jsonify({}), 200
 
-    patient_name = _get_patient_name(request.headers.get("Authorization", ""))
-    if not patient_name:
+    patient_id = _get_patient_id(request.headers.get("Authorization", ""))
+    if not patient_id:
         return jsonify({"error": "Unauthorized"}), 401
-
-    data         = request.form
-    display_name = data.get("patientName", patient_name)
 
     file = request.files.get("file")
     success, status_code, result = _report_analyzer.analyze(file)
@@ -168,7 +163,7 @@ def analyze_report():
     if not success:
         return jsonify({"error": result}), status_code
 
-    # Re-read the stream after analyze() consumed it
+    # Re-read after analyze() consumed the stream
     file.seek(0)
     file_bytes  = file.read()
     report_text = _extract_text_from_pdf(file_bytes)
@@ -176,13 +171,13 @@ def analyze_report():
     if not report_text:
         return jsonify({"error": "Could not extract text from PDF (may be scanned)."}), 422
 
-    # Store report text directly inside the router — one source of truth
-    router = _get_router(display_name)
+    # Store in the router keyed on JWT userId — same key /chat uses
+    router = _get_router(patient_id)
     router._report_text    = report_text
-    router._report_history = []   # fresh Q&A history for this report
+    router._report_history = []
 
     return jsonify({
-        "patient":    display_name,
+        "patient":    patient_id,
         "analysis":   result,
         "has_report": True,
     })
@@ -194,16 +189,13 @@ def reset():
     if request.method == "OPTIONS":
         return jsonify({}), 200
 
-    patient_name = _get_patient_name(request.headers.get("Authorization", ""))
-    if not patient_name:
+    patient_id = _get_patient_id(request.headers.get("Authorization", ""))
+    if not patient_id:
         return jsonify({"error": "Unauthorized"}), 401
 
-    data         = request.get_json() or {}
-    display_name = data.get("patientName", patient_name)
-
-    if display_name in _routers:
-        _routers[display_name].close()
-        del _routers[display_name]
+    if patient_id in _routers:
+        _routers[patient_id].close()
+        del _routers[patient_id]
 
     return jsonify({"status": "reset"})
 
@@ -214,15 +206,12 @@ def clear_report():
     if request.method == "OPTIONS":
         return jsonify({}), 200
 
-    patient_name = _get_patient_name(request.headers.get("Authorization", ""))
-    if not patient_name:
+    patient_id = _get_patient_id(request.headers.get("Authorization", ""))
+    if not patient_id:
         return jsonify({"error": "Unauthorized"}), 401
 
-    data         = request.get_json() or {}
-    display_name = data.get("patientName", patient_name)
-
-    if display_name in _routers:
-        router = _routers[display_name]
+    if patient_id in _routers:
+        router = _routers[patient_id]
         router._report_text    = ""
         router._report_history = []
 
@@ -230,33 +219,28 @@ def clear_report():
 
 
 # ── /chat-report — DEPRECATED: kept for backwards compatibility ───────────────
-# Old frontend code that still hits this endpoint will work, but new code
-# should just use /chat for everything.
-
 @app.route("/chat-report", methods=["POST", "OPTIONS"])
 def chat_report():
     if request.method == "OPTIONS":
         return jsonify({}), 200
 
-    patient_name = _get_patient_name(request.headers.get("Authorization", ""))
-    if not patient_name:
+    patient_id = _get_patient_id(request.headers.get("Authorization", ""))
+    if not patient_id:
         return jsonify({"error": "Unauthorized"}), 401
 
-    data         = request.get_json()
-    question     = (data or {}).get("message", "").strip()
-    display_name = (data or {}).get("patientName", patient_name)
+    data     = request.get_json()
+    question = (data or {}).get("message", "").strip()
 
     if not question:
         return jsonify({"error": "Empty message"}), 400
 
-    router = _get_router(display_name)
+    router = _get_router(patient_id)
 
     if not router.has_report:
         return jsonify({
             "error": "No report found. Please upload your medical report first."
         }), 400
 
-    # Delegate to unified handler — router will pick "report" agent
     reply = router.handle(question)
     return jsonify({"reply": reply})
 
