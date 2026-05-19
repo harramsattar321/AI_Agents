@@ -1,18 +1,13 @@
 """
 booking_agent.py — Agent 2: The Booking Clerk
 =============================================
-FIXES in this version:
-  1. Doctor slots come FROM DB (timeSlots field), not hardcoded 9-5
-  2. High priority ALWAYS books at the FIRST slot of doctor's day window
-     (even if a Normal appointment already exists there — doctor sees both)
-  3. Doctor ID ALWAYS taken from DB _resolved_doctor["id"] — NEVER from LLM args
-     (fixes wrong doctor_id stored in DB)
-  4. confirmed_time_slot returned in book_appointment result so LLM
-     displays the CORRECT time to user (fixes wrong time shown to user)
-  5. Year forced to current year in system prompt (never past years)
-  6. Priority auto-detected from reason — patient is NEVER asked for it
-  7. Day/date verification works correctly
-  8. Malformed tool JSON handled gracefully
+All slot conflict logic lives in db.py now.
+This agent handles:
+  - Conversation flow (5 steps: doctor → day/date → time → reason → book)
+  - Tool execution (calls db.py methods)
+  - Emergency alt-doctor suggestion when db returns needs_alt_doctor=True
+  - Patient conflict messaging
+  - Groq LLM for natural language only — not for slot logic
 """
 
 import json
@@ -21,7 +16,8 @@ from datetime import datetime, timedelta
 from groq import Groq
 
 
-# ── Current date helpers ──────────────────────────────────────────────────────
+# ── Date/time helpers ─────────────────────────────────────────────────────────
+
 def _today_str() -> str:
     return datetime.today().strftime("%Y-%m-%d")
 
@@ -32,18 +28,9 @@ def _current_year() -> int:
     return datetime.today().year
 
 
-# ── Build valid 15-min slots from a doctor's timeSlots array ─────────────────
+# ── Build 15-min slots from a doctor's timeSlots array ───────────────────────
+
 def build_slots_for_doctor(doctor: dict) -> list[str]:
-    """
-    Given a doctor document (with timeSlots list), build all valid 15-min
-    sub-slots across ALL of the doctor's time windows.
-
-    timeSlots entry example:
-      {"day": "Wednesday", "startTime": "09:00", "endTime": "12:00", ...}
-
-    Returns sorted unique list of "HH:MM AM/PM" strings, e.g.
-      ["09:00 AM", "09:15 AM", ..., "11:45 AM"]
-    """
     slots_set = set()
     for window in (doctor.get("timeSlots") or []):
         try:
@@ -57,47 +44,14 @@ def build_slots_for_doctor(doctor: dict) -> list[str]:
             current += timedelta(minutes=15)
 
     def _sort_key(s):
-        try:
-            return datetime.strptime(s, "%I:%M %p")
-        except ValueError:
-            return datetime.min
+        try:    return datetime.strptime(s, "%I:%M %p")
+        except: return datetime.min
 
     return sorted(slots_set, key=_sort_key)
 
 
-def _first_slot_for_day(doctor: dict, day_name: str) -> str | None:
-    """
-    Return the very first 15-min slot for a specific day from the doctor's
-    timeSlots. Used for High Priority booking.
-    """
-    day_name = day_name.strip().capitalize()
-    windows_today = [
-        w for w in (doctor.get("timeSlots") or [])
-        if w.get("day", "").strip().capitalize() == day_name
-    ]
-    if not windows_today:
-        windows_today = doctor.get("timeSlots") or []
-    if not windows_today:
-        return None
-
-    earliest = None
-    for w in windows_today:
-        try:
-            t = datetime.strptime(w["startTime"], "%H:%M")
-            if earliest is None or t < earliest:
-                earliest = t
-        except (KeyError, ValueError):
-            continue
-
-    if earliest is None:
-        return None
-
-    return earliest.strftime("%I:%M %p").lstrip("0") or "12:00 AM"
-
-
 def _all_slots_for_day(doctor: dict, day_name: str) -> list[str]:
-    """All 15-min slots available for a doctor on a specific day name."""
-    day_name = day_name.strip().capitalize()
+    day_name  = day_name.strip().capitalize()
     slots_set = set()
     for window in (doctor.get("timeSlots") or []):
         if window.get("day", "").strip().capitalize() != day_name:
@@ -113,15 +67,13 @@ def _all_slots_for_day(doctor: dict, day_name: str) -> list[str]:
             current += timedelta(minutes=15)
 
     def _sort_key(s):
-        try:
-            return datetime.strptime(s, "%I:%M %p")
-        except ValueError:
-            return datetime.min
+        try:    return datetime.strptime(s, "%I:%M %p")
+        except: return datetime.min
 
     return sorted(slots_set, key=_sort_key)
 
 
-# ── Fallback global slots (only used when no doctor resolved yet) ─────────────
+# ── Fallback slots ────────────────────────────────────────────────────────────
 from slots import VALID_SLOTS, VALID_SLOTS_SET
 
 
@@ -144,33 +96,34 @@ def normalise_time(raw: str) -> str | None:
     m = _TIME_CLEAN.search(raw)
     if m:
         h, mn = int(m.group(1)), int(m.group(2))
-        ampm = m.group(3).upper().replace('.', '').replace(' ', '')
-        ampm = "AM" if "A" in ampm else "PM"
+        ampm  = m.group(3).upper().replace('.','').replace(' ','')
+        ampm  = "AM" if "A" in ampm else "PM"
         return f"{h:02d}:{mn:02d} {ampm}"
     return None
 
 
 # ── Date validator ────────────────────────────────────────────────────────────
+
 def validate_date(date_str: str) -> dict:
     try:
         date_obj = datetime.strptime(date_str, "%Y-%m-%d")
     except ValueError:
         parts = date_str.split("-")
-        hint = ""
+        hint  = ""
         if len(parts) == 3:
             try:
                 y, m, d = parts
                 if len(y) == 4 and int(y) < _current_year():
                     hint = f" The year {y} is in the past — did you mean {_current_year()}?"
                 elif int(m) > 12:
-                    hint = f" Month {m} is invalid (must be 01-12). Did you swap month and day?"
+                    hint = f" Month {m} is invalid. Did you swap month and day?"
                 elif int(d) > 31:
                     hint = f" Day {d} is too large."
             except Exception:
                 pass
         return {
             "valid":   False,
-            "message": f"'{date_str}' is not a valid date.{hint} Please use YYYY-MM-DD (e.g. {_current_year()}-04-14)."
+            "message": f"'{date_str}' is not a valid date.{hint} Please use YYYY-MM-DD."
         }
 
     today = datetime.today().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -190,6 +143,7 @@ def validate_date(date_str: str) -> dict:
 
 
 # ── Day verification ──────────────────────────────────────────────────────────
+
 def verify_day_matches_date(day_name: str, date_str: str) -> dict:
     check = validate_date(date_str)
     if not check["valid"]:
@@ -204,11 +158,10 @@ def verify_day_matches_date(day_name: str, date_str: str) -> dict:
             "actual_day": actual_day,
             "date":       date_str,
             "message": (
-                f"Confirmed — {date_str} is indeed {actual_day}." if matched
+                f"Confirmed — {date_str} is {actual_day}." if matched
                 else (
                     f"{date_str} is actually {actual_day}, not {day_name.strip().capitalize()}. "
-                    f"Please give the correct date for a {day_name.strip().capitalize()}, "
-                    f"or correct the day name."
+                    f"Please correct the date or the day name."
                 )
             )
         }
@@ -231,6 +184,7 @@ def classify_priority(reason: str) -> str:
 
 
 # ── Safe JSON parse ───────────────────────────────────────────────────────────
+
 def safe_parse_args(raw: str) -> dict:
     raw = raw.strip()
     if not raw.startswith("{"):
@@ -246,63 +200,77 @@ def safe_parse_args(raw: str) -> dict:
 
 
 # ── System prompt ─────────────────────────────────────────────────────────────
+
 def build_system_prompt(patient_name: str) -> str:
     today_disp = _today_display()
     year       = _current_year()
     return f"""You are the Booking Clerk at Harram Hospital. Be concise. No greetings or filler.
-TODAY: {today_disp}. Current year is {year}. NEVER use any year before {year}. All dates must be real calendar dates in {year} or later.
+TODAY: {today_disp}. Current year is {year}. NEVER use any year before {year}.
 
 STRICT BOOKING STEPS — follow in exact order, never skip:
 
 STEP 1 — DOCTOR
   Call get_doctor_info with the doctor name or specialty the patient mentioned.
-  Confirm doctor name and ID with the patient.
+  Confirm doctor name with the patient.
 
 STEP 2 — DAY + DATE
   Ask patient for both day name AND date together (e.g. "Wednesday 2026-04-16").
-  Call verify_day_date to confirm the day matches the date.
-  If mismatch → tell the patient exactly what the actual day is and ask to correct.
-  If date is in the past or invalid → tell patient and ask again.
-  Always use year {year} or later. NEVER suggest or accept dates in past years.
+  Call verify_day_date. If mismatch or past date → tell patient and ask again.
 
-STEP 3 — TIME
-  Show the patient the doctor's available time slots for that day (call get_doctor_slots).
-  Ask the patient which time slot they prefer.
-  Call check_slots to verify availability.
-  If check_slots or book_appointment returns "slot_full" error with a "next_free_slot" field:
-    → Immediately call book_appointment again using next_free_slot as the time_slot.
-    → Do NOT ask the patient again — just book the next available slot automatically.
-    → Inform the patient AFTER booking: "Slot X was taken, so I've booked you at Y instead."
-  If the whole day is fully booked → suggest the same time next week.
-
-STEP 4 — REASON (MANDATORY — NEVER SKIP)
+STEP 3 — REASON (MANDATORY — NEVER SKIP)
   ALWAYS ask: "What is the reason for your visit?"
-  Wait for the patient to reply.
-  Then call classify_priority with exactly what the patient said.
-  NEVER ask the patient whether their priority is Normal or High — it is auto-detected.
-  NEVER call book_appointment before classify_priority has been called.
+  Wait for the reply. Then call classify_priority with exactly what the patient said.
+  NEVER ask the patient whether priority is Normal or High — it is auto-detected.
+
+STEP 4 — TIME
+  Now that priority is known, call get_doctor_slots with day_name, appointment_date,
+  AND priority — this returns only genuinely free slots for the patient's priority.
+  Show these slots to the patient and ask which one they prefer.
+  If filtered=False in the result (no date/priority passed), remind the LLM to
+  pass both next time — but still show the slots and proceed.
 
 STEP 5 — BOOK
-  Only after classify_priority has been called, call book_appointment.
-  Use the exact doctor_id returned by get_doctor_info (the "id" field).
-  CRITICAL: After book_appointment returns, read the "confirmed_time_slot" field
-  from the tool result. Use THAT value as the time in your reply — NEVER use the
-  time_slot argument you passed in, as the system may have adjusted it for priority.
+  Call book_appointment only after classify_priority has been called.
+  Use the exact doctor_id from get_doctor_info. Never invent it.
+
+SPECIAL CASE — patient asks for slots BEFORE giving reason:
+  Call get_doctor_slots with only day_name (no priority, no date).
+  Show the structural slots returned, then immediately ask: "What is the reason for your visit?"
+  Once reason is given, call classify_priority, then call get_doctor_slots again
+  with day_name + appointment_date + priority to show the accurate filtered list.
+
+HANDLING BOOK RESULTS:
+  Success → reply ONLY:
+    "BOOKING_COMPLETE: Appointment confirmed for {patient_name} with {{doctor}} on {{date}} at {{confirmed_time_slot}} [{{priority}} priority]."
+    Always use confirmed_time_slot from the result — not the time_slot you passed in.
+
+  error = patient_clash →
+    "You already have an appointment at that time. Please choose a different slot."
+    Then call get_doctor_slots again and ask for a new time.
+
+  error = slot_full →
+    "That slot is fully booked."
+    Then call get_doctor_slots to show remaining free slots.
+
+  error = no_emergency_slot + needs_alt_doctor = true →
+    Call get_alt_doctors with the doctor's department/specialty.
+    Present the alternatives to the patient and ask which one they prefer.
+    Once patient picks one, restart from STEP 2 with the new doctor.
+
+  override_used = true in success result →
+    Inform patient: "A previously scheduled Normal appointment in that slot was
+    cancelled to accommodate your emergency. Your appointment is confirmed."
+
+  Cancellation → reply ONLY: "BOOKING_CANCELLED"
 
 RULES:
   - One question at a time.
-  - NEVER invent or assume a doctor_id — always use the id from get_doctor_info result.
-  - High priority patients are automatically booked at the FIRST slot of the doctor's
-    day window regardless of normal appointments in that slot.
-  - On successful booking reply ONLY:
-    "BOOKING_COMPLETE: Appointment confirmed for {patient_name} with {{doctor}} on {{date}} at {{confirmed_time_slot}} [{{priority}} priority]."
-    Where {{confirmed_time_slot}} is taken from the "confirmed_time_slot" field of the
-    book_appointment tool result — NOT from the time_slot argument you passed in.
-  - On cancellation reply ONLY: "BOOKING_CANCELLED"
+  - Never invent or assume a doctor_id.
+  - Never ask patient about priority — classify_priority decides it.
 """
 
 
-# ── Model fallback chain ──────────────────────────────────────────────────────
+# ── Model chain ───────────────────────────────────────────────────────────────
 _MODEL_CHAIN = [
     "llama-3.3-70b-versatile",
     "llama-3.1-70b-versatile",
@@ -310,36 +278,32 @@ _MODEL_CHAIN = [
 ]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  BOOKING AGENT
+# ─────────────────────────────────────────────────────────────────────────────
+
 class BookingAgent:
+
     def __init__(self, groq_api_key_2: str, db, patient_name: str):
         self.client              = Groq(api_key=groq_api_key_2)
         self.db                  = db
-        self.patient_name        = patient_name
+        self.patient_name        = patient_name   # stores patient ID
         self.history: list[dict] = []
-        self._resolved_doctor    = None   # full doctor document from DB
-        self._detected_priority  = None   # "Normal" | "High"
-        self._pending_next_week  = None   # (date_str, time_slot) for next-week confirm
+        self._resolved_doctor    = None
+        self._detected_priority  = None
+        self._pending_next_week  = None
         self._model              = _MODEL_CHAIN[0]
 
-    # ── Coerce to int safely ──────────────────────────────────────────────────
     @staticmethod
     def _int(val, default=0) -> int:
-        try:
-            return int(val)
-        except (TypeError, ValueError):
-            return default
+        try:    return int(val)
+        except: return default
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # BUG FIX #2: _doctor_id() is now the SINGLE source of truth.
-    # It ONLY reads from self._resolved_doctor (set by get_doctor_info from DB).
-    # We NEVER fall back to LLM-provided doctor_id anywhere in the code.
-    # ─────────────────────────────────────────────────────────────────────────
     def _doctor_id(self) -> int:
         if self._resolved_doctor:
             return self._int(self._resolved_doctor.get("id", 0))
         return 0
 
-    # ── Doctor's slots for a specific day ────────────────────────────────────
     def _doctor_day_slots(self, day_name: str) -> list[str]:
         if self._resolved_doctor:
             slots = _all_slots_for_day(self._resolved_doctor, day_name)
@@ -348,6 +312,8 @@ class BookingAgent:
             return build_slots_for_doctor(self._resolved_doctor) or VALID_SLOTS
         return VALID_SLOTS
 
+    # ── Tool definitions ──────────────────────────────────────────────────────
+
     @property
     def _tools(self):
         return [
@@ -355,7 +321,7 @@ class BookingAgent:
                 "type": "function",
                 "function": {
                     "name": "get_doctor_info",
-                    "description": "Search doctor by name or specialty. Returns doctor list with id, name, specialty, timeSlots, availableDays.",
+                    "description": "Search doctor by name or specialty. Returns list with id, name, specialty, timeSlots, availableDays.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -369,13 +335,24 @@ class BookingAgent:
                 "type": "function",
                 "function": {
                     "name": "get_doctor_slots",
-                    "description": "Get all valid 15-minute time slots for the resolved doctor on a specific day name.",
+                    "description": (
+                        "Get slots for the resolved doctor on a specific day. "
+                        "If priority is known (classify_priority already called), pass it — "
+                        "returns only free slots for that priority. "
+                        "If priority is not yet known, omit it — returns all structural slots."
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "day_name": {
+                            "day_name": {"type": "string"},
+                            "appointment_date": {
                                 "type": "string",
-                                "description": "Day of week e.g. Wednesday"
+                                "description": "YYYY-MM-DD — required when priority is passed so DB availability can be checked."
+                            },
+                            "priority": {
+                                "type": "string",
+                                "enum": ["Normal", "High"],
+                                "description": "Only pass if classify_priority has already been called."
                             }
                         },
                         "required": ["day_name"]
@@ -386,7 +363,7 @@ class BookingAgent:
                 "type": "function",
                 "function": {
                     "name": "verify_day_date",
-                    "description": "Verify that the day name matches the calendar date. Call after patient gives day + date.",
+                    "description": "Verify the day name matches the calendar date.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -401,14 +378,11 @@ class BookingAgent:
                 "type": "function",
                 "function": {
                     "name": "classify_priority",
-                    "description": "Auto-detect High or Normal priority from the patient's stated reason for visit. MUST be called before book_appointment.",
+                    "description": "Detect High or Normal priority from the patient's visit reason. MUST be called before book_appointment.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "reason": {
-                                "type": "string",
-                                "description": "Exact reason the patient gave for their visit."
-                            }
+                            "reason": {"type": "string"}
                         },
                         "required": ["reason"]
                     }
@@ -417,33 +391,20 @@ class BookingAgent:
             {
                 "type": "function",
                 "function": {
-                    "name": "check_slots",
-                    "description": "Check if a specific 15-min slot is free for the doctor on a date.",
+                    "name": "get_alt_doctors",
+                    "description": (
+                        "Get alternative doctors when the primary doctor has no emergency slot available. "
+                        "Searches by department or specialty first, then broadly."
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "doctor_id":        {"type": "integer"},
-                            "appointment_date": {"type": "string", "description": "YYYY-MM-DD"},
-                            "time_slot":        {"type": "string"},
-                            "priority":         {"type": "string", "enum": ["Normal", "High"]}
+                            "department": {
+                                "type": "string",
+                                "description": "Department or specialty of the original doctor."
+                            }
                         },
-                        "required": ["doctor_id", "appointment_date", "time_slot", "priority"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_available_slots",
-                    "description": "Get all free 15-min slots for a doctor/date/priority.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "doctor_id":        {"type": "integer"},
-                            "appointment_date": {"type": "string"},
-                            "priority":         {"type": "string", "enum": ["Normal", "High"]}
-                        },
-                        "required": ["doctor_id", "appointment_date", "priority"]
+                        "required": ["department"]
                     }
                 }
             },
@@ -452,16 +413,17 @@ class BookingAgent:
                 "function": {
                     "name": "book_appointment",
                     "description": (
-                        "Book the appointment. Only call AFTER classify_priority has been called. "
-                        "The result contains 'confirmed_time_slot' — ALWAYS use that field "
-                        "for the time shown to the patient, not the time_slot argument you passed in."
+                        "Book the appointment. Only call AFTER classify_priority. "
+                        "For High priority the DB finds the nearest available slot automatically — "
+                        "pass the patient's requested time as time_slot. "
+                        "The result contains confirmed_time_slot — always use that in your reply."
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "doctor_id":        {"type": "integer"},
                             "doctor_name":      {"type": "string"},
-                            "appointment_date": {"type": "string"},
+                            "appointment_date": {"type": "string", "description": "YYYY-MM-DD"},
                             "time_slot":        {"type": "string"},
                             "priority":         {"type": "string", "enum": ["Normal", "High"]}
                         },
@@ -471,17 +433,17 @@ class BookingAgent:
             }
         ]
 
+    # ── Tool execution ────────────────────────────────────────────────────────
+
     def _execute_tool(self, func_name: str, args: dict) -> str:
         try:
+
             # ── get_doctor_info ───────────────────────────────────────────────
             if func_name == "get_doctor_info":
                 results = self.db.get_doctors(args.get("search_term", ""))
                 if results:
-                    # Store the FIRST matched doctor — id comes from DB only
                     self._resolved_doctor = results[0]
-                    # Ensure id is always an int
-                    if "id" in self._resolved_doctor:
-                        self._resolved_doctor["id"] = self._int(self._resolved_doctor["id"])
+                    self._resolved_doctor["id"] = self._int(self._resolved_doctor.get("id", 0))
                 return json.dumps(results, default=str)
 
             # ── get_doctor_slots ──────────────────────────────────────────────
@@ -490,26 +452,63 @@ class BookingAgent:
                 if not self._resolved_doctor:
                     return json.dumps({
                         "error":   "no_doctor",
-                        "message": "No doctor resolved yet. Call get_doctor_info first."
+                        "message": "No doctor resolved. Call get_doctor_info first."
                     })
-                slots = _all_slots_for_day(self._resolved_doctor, day_name)
-                if not slots:
-                    avail_days = self._resolved_doctor.get("availableDays", [])
+
+                avail_days  = self._resolved_doctor.get("availableDays", [])
+                all_slots   = _all_slots_for_day(self._resolved_doctor, day_name)
+
+                if not all_slots:
                     return json.dumps({
-                        "error":           "no_slots_on_day",
-                        "day":             day_name,
-                        "available_days":  avail_days,
+                        "error":          "no_slots_on_day",
+                        "day":            day_name,
+                        "available_days": avail_days,
                         "message": (
-                            f"Dr. {self._resolved_doctor.get('name','?')} is not available on {day_name}. "
-                            f"Available days: {', '.join(avail_days)}."
+                            f"Dr. {self._resolved_doctor.get('name','?')} is not available "
+                            f"on {day_name}. Available days: {', '.join(avail_days)}."
                         )
                     })
+
+                # Priority known + date provided → filter by actual DB availability
+                priority         = args.get("priority") or self._detected_priority
+                appointment_date = args.get("appointment_date", "")
+
+                if priority and appointment_date:
+                    date_chk = validate_date(appointment_date)
+                    if date_chk["valid"]:
+                        doctor_id = self._doctor_id()
+                        free_slots = [
+                            s for s in all_slots
+                            if not self.db.check_slots(
+                                doctor_id, appointment_date, s, priority,
+                                self.patient_name
+                            ).get("slot_full")
+                        ]
+                        return json.dumps({
+                            "doctor":          self._resolved_doctor.get("name"),
+                            "doctor_id":       doctor_id,
+                            "day":             day_name,
+                            "date":            appointment_date,
+                            "priority":        priority,
+                            "slots":           free_slots,
+                            "count":           len(free_slots),
+                            "filtered":        True,
+                            "note": (
+                                "These are genuinely free slots for your priority. "
+                                if free_slots else
+                                "No free slots on this day for your priority."
+                            )
+                        })
+
+                # Priority not yet known — return structural slots, no DB check
                 return json.dumps({
                     "doctor":    self._resolved_doctor.get("name"),
                     "doctor_id": self._doctor_id(),
                     "day":       day_name,
-                    "slots":     slots,
-                    "count":     len(slots)
+                    "slots":     all_slots,
+                    "count":     len(all_slots),
+                    "filtered":  False,
+                    "note":      "Slots shown without availability filter — reason not yet collected."
                 })
 
             # ── verify_day_date ───────────────────────────────────────────────
@@ -518,13 +517,16 @@ class BookingAgent:
                     args.get("day_name", ""), args.get("date_str", "")
                 )
                 if result.get("matched") and self._resolved_doctor:
-                    actual_day  = result.get("actual_day", "")
-                    avail_days  = [d.strip() for d in (self._resolved_doctor.get("availableDays") or [])]
+                    actual_day = result.get("actual_day", "")
+                    avail_days = [
+                        d.strip() for d in
+                        (self._resolved_doctor.get("availableDays") or [])
+                    ]
                     if avail_days and actual_day not in avail_days:
                         result["doctor_available"] = False
                         result["message"] += (
                             f" However, Dr. {self._resolved_doctor.get('name','?')} "
-                            f"is NOT available on {actual_day}. "
+                            f"is not available on {actual_day}. "
                             f"Available days: {', '.join(avail_days)}."
                         )
                     else:
@@ -537,341 +539,142 @@ class BookingAgent:
                 self._detected_priority = p
                 return json.dumps({
                     "priority": p,
-                    "message":  f"Priority auto-detected as {p} based on patient's reason."
+                    "message":  f"Priority auto-detected as {p}."
                 })
 
-            # ── check_slots ───────────────────────────────────────────────────
-            elif func_name == "check_slots":
-                date_str  = args.get("appointment_date", "")
-                date_chk  = validate_date(date_str)
-                if not date_chk["valid"]:
-                    return json.dumps({"error": "invalid_date", "message": date_chk["message"]})
+            # ── get_alt_doctors ───────────────────────────────────────────────
+            elif func_name == "get_alt_doctors":
+                department = args.get("department", "")
+                current_id = self._doctor_id()
 
-                slot      = normalise_time(args.get("time_slot", "")) or args.get("time_slot", "")
-                priority  = args.get("priority", self._detected_priority or "Normal")
-
-                # BUG FIX #2: Always use DB doctor_id — never trust LLM args
-                doctor_id = self._doctor_id()
-                if not doctor_id:
-                    return json.dumps({
-                        "error":   "doctor_not_resolved",
-                        "message": "Doctor not resolved. Please call get_doctor_info first."
-                    })
-
-                result = self.db.check_slots(
-                    doctor_id=doctor_id,
-                    appointment_date=date_str,
-                    time_slot=slot,
-                    priority=priority
+                # Try same department first
+                alts = self.db.get_doctors_by_department(
+                    department, exclude_doctor_id=current_id
                 )
 
-                if result.get("slot_full"):
-                    date_obj  = datetime.strptime(date_str, "%Y-%m-%d")
-                    day_name  = date_obj.strftime("%A")
-                    day_slots = self._doctor_day_slots(day_name)
-                    alts = []
-                    try:
-                        try:
-                            idx = day_slots.index(slot)
-                        except ValueError:
-                            # Fallback: match by parsed time value
-                            try:
-                                slot_dt = datetime.strptime(slot, "%I:%M %p")
-                            except ValueError:
-                                slot_dt = None
-                            idx = -1
-                            if slot_dt:
-                                for i, s in enumerate(day_slots):
-                                    try:
-                                        if datetime.strptime(s, "%I:%M %p") == slot_dt:
-                                            idx = i
-                                            break
-                                    except ValueError:
-                                        continue
-                        if idx >= 0:
-                            alts = day_slots[idx + 1: idx + 4]
-                    except Exception:
-                        alts = []
-                    result["suggested_alternatives"] = alts
+                if not alts:
+                    # Broaden — get all doctors except the current one
+                    all_docs = self.db.get_doctors()
+                    alts = [d for d in all_docs if d.get("id") != current_id]
 
-                return json.dumps(result, default=str)
-
-            # ── get_available_slots ───────────────────────────────────────────
-            elif func_name == "get_available_slots":
-                date_str  = args.get("appointment_date", "")
-                date_chk  = validate_date(date_str)
-                if not date_chk["valid"]:
-                    return json.dumps({"error": "invalid_date", "message": date_chk["message"]})
-
-                priority  = args.get("priority", self._detected_priority or "Normal")
-
-                # BUG FIX #2: Always use DB doctor_id
-                doctor_id = self._doctor_id()
-                if not doctor_id:
+                if not alts:
                     return json.dumps({
-                        "error":   "doctor_not_resolved",
-                        "message": "Doctor not resolved. Please call get_doctor_info first."
+                        "found":   False,
+                        "message": "No alternative doctors available at this time."
                     })
 
-                date_obj  = datetime.strptime(date_str, "%Y-%m-%d")
-                day_name  = date_obj.strftime("%A")
-                day_slots = self._doctor_day_slots(day_name)
-
-                available = []
-                full      = []
-                for slot in day_slots:
-                    info = self.db.check_slots(doctor_id, date_str, slot, priority)
-                    (full if info["slot_full"] else available).append(slot)
-
-                next_week     = (date_obj + timedelta(days=7)).strftime("%Y-%m-%d")
-                next_week_day = (date_obj + timedelta(days=7)).strftime("%A")
+                # Format for the LLM to present to patient
+                formatted = []
+                for d in alts[:5]:   # cap at 5 suggestions
+                    formatted.append({
+                        "id":          d.get("id"),
+                        "name":        d.get("name"),
+                        "specialty":   d.get("specialty", ""),
+                        "department":  d.get("department", ""),
+                        "fee":         d.get("consultationFee", d.get("fee", "")),
+                        "availableDays": d.get("availableDays", []),
+                    })
 
                 return json.dumps({
-                    "doctor_id":      doctor_id,
-                    "date":           date_str,
-                    "priority":       priority,
-                    "free_slots":     available,
-                    "full_slots":     full,
-                    "total_free":     len(available),
-                    "next_week_date": next_week,
-                    "next_week_day":  next_week_day
-                }, default=str)
+                    "found":    True,
+                    "same_dept": bool(
+                        self.db.get_doctors_by_department(
+                            department, exclude_doctor_id=current_id
+                        )
+                    ),
+                    "doctors":  formatted,
+                    "message":  (
+                        f"Found {len(formatted)} alternative doctor(s). "
+                        f"Present these to the patient and ask which one they prefer."
+                    )
+                })
 
             # ── book_appointment ──────────────────────────────────────────────
             elif func_name == "book_appointment":
 
-                # HARD GUARD 1: reason must be collected first
+                # Guard: reason must be collected first
                 if self._detected_priority is None:
                     return json.dumps({
                         "error":   "reason_required",
-                        "message": "You MUST ask the patient for their visit reason and call classify_priority first. Do NOT book without it."
+                        "message": "MUST call classify_priority before book_appointment."
                     })
 
-                date_str  = args.get("appointment_date", "")
-                date_chk  = validate_date(date_str)
+                date_str = args.get("appointment_date", "")
+                date_chk = validate_date(date_str)
                 if not date_chk["valid"]:
                     return json.dumps({"error": "invalid_date", "message": date_chk["message"]})
 
-                # Always use auto-detected priority — never trust LLM arg
-                priority  = self._detected_priority
-
-                # ─────────────────────────────────────────────────────────────
-                # BUG FIX #2: STRICT doctor_id — only from DB, NEVER from LLM.
-                # If _resolved_doctor is not set, refuse to book.
-                # ─────────────────────────────────────────────────────────────
+                # Always use DB doctor_id — never trust LLM arg
                 doctor_id = self._doctor_id()
                 if not doctor_id:
                     return json.dumps({
                         "error":   "doctor_not_resolved",
-                        "message": "Doctor ID could not be determined. Please call get_doctor_info first to resolve the doctor from the database."
+                        "message": "Call get_doctor_info first to resolve the doctor."
                     })
 
-                raw_slot  = args.get("time_slot", "")
-                slot      = normalise_time(raw_slot) or raw_slot
+                priority = self._detected_priority   # always from classify_priority
+                raw_slot = args.get("time_slot", "")
+                slot     = normalise_time(raw_slot) or raw_slot
 
                 date_obj  = datetime.strptime(date_str, "%Y-%m-%d")
                 day_name  = date_obj.strftime("%A")
                 day_slots = self._doctor_day_slots(day_name)
 
-                # ── HIGH PRIORITY: always use the FIRST slot of the day ───────
-                if priority == "High":
-                    first_slot = (
-                        _first_slot_for_day(self._resolved_doctor, day_name)
-                        if self._resolved_doctor
-                        else (day_slots[0] if day_slots else slot)
-                    )
-                    # Override whatever slot was passed in — High always starts at day's first slot
-                    slot = first_slot or slot
-
-                    # Check if this High slot is already taken by another High
-                    chk = self.db.check_slots(doctor_id, date_str, slot, "High")
-                    if chk.get("slot_full"):
-                        # Move to next available slot for High priority
-                        # BUG FIX #4 applied here too: use time-value matching fallback
-                        try:
-                            try:
-                                idx = day_slots.index(slot)
-                            except ValueError:
-                                try:
-                                    slot_dt = datetime.strptime(slot, "%I:%M %p")
-                                except ValueError:
-                                    slot_dt = None
-                                idx = -1
-                                if slot_dt:
-                                    for i, s in enumerate(day_slots):
-                                        try:
-                                            if datetime.strptime(s, "%I:%M %p") == slot_dt:
-                                                idx = i
-                                                break
-                                        except ValueError:
-                                            continue
-
-                            next_high_slot = None
-                            if idx >= 0:
-                                for candidate in day_slots[idx + 1:]:
-                                    c2 = self.db.check_slots(doctor_id, date_str, candidate, "High")
-                                    if not c2.get("slot_full"):
-                                        next_high_slot = candidate
-                                        break
-
-                            if next_high_slot:
-                                slot = next_high_slot
-                            else:
-                                # Whole day full for High — suggest next week
-                                nw_date = (date_obj + timedelta(days=7)).strftime("%Y-%m-%d")
-                                nw_day  = (date_obj + timedelta(days=7)).strftime("%A")
-                                self._pending_next_week = (nw_date, slot)
-                                return json.dumps({
-                                    "success":        False,
-                                    "error":          "day_full_for_high",
-                                    "message":        f"All High-priority slots on {date_str} are full. Suggest: {slot} on {nw_date} ({nw_day}). Confirm with patient.",
-                                    "next_week_date": nw_date,
-                                    "next_week_day":  nw_day
-                                })
-                        except Exception:
-                            pass
-
-                    # High priority books regardless of Normal in same slot
-                    result = self.db.book_appointment(
-                        patient_name=self.patient_name,
-                        doctor_id=doctor_id,
-                        doctor_name=args.get("doctor_name", self._resolved_doctor.get("name", "") if self._resolved_doctor else ""),
-                        appointment_date=date_str,
-                        time_slot=slot,
-                        priority="High"
-                    )
-
-                    # ─────────────────────────────────────────────────────────
-                    # BUG FIX #1: Add confirmed_time_slot to result so the LLM
-                    # displays the ACTUAL booked time, not its own argument.
-                    # ─────────────────────────────────────────────────────────
-                    if isinstance(result, dict):
-                        result["confirmed_time_slot"] = slot
-                        result["confirmed_priority"]  = "High"
-                    else:
-                        result = {
-                            "success":              True,
-                            "confirmed_time_slot":  slot,
-                            "confirmed_priority":   "High"
-                        }
-
-                    return json.dumps(result, default=str)
-
-                # ── NORMAL PRIORITY ───────────────────────────────────────────
-                chk = self.db.check_slots(doctor_id, date_str, slot, "Normal")
-                if chk.get("slot_full"):
-                    # ─────────────────────────────────────────────────────────
-                    # BUG FIX #4: slot format mismatch caused ValueError on
-                    # day_slots.index(slot), which fell through to "day full".
-                    # Fix: try both the normalised slot AND a stripped version,
-                    # and scan all slots by parsed time value as fallback.
-                    # ─────────────────────────────────────────────────────────
-                    free = None
-                    try:
-                        # Try exact match first
-                        try:
-                            idx = day_slots.index(slot)
-                        except ValueError:
-                            # Fallback: match by parsed time value
-                            try:
-                                slot_dt = datetime.strptime(slot, "%I:%M %p")
-                            except ValueError:
-                                slot_dt = None
-
-                            idx = -1
-                            if slot_dt:
-                                for i, s in enumerate(day_slots):
-                                    try:
-                                        if datetime.strptime(s, "%I:%M %p") == slot_dt:
-                                            idx = i
-                                            break
-                                    except ValueError:
-                                        continue
-
-                        if idx >= 0:
-                            for candidate in day_slots[idx + 1:]:
-                                c2 = self.db.check_slots(doctor_id, date_str, candidate, "Normal")
-                                if not c2.get("slot_full"):
-                                    free = candidate
-                                    break
-                    except Exception:
-                        free = None
-
-                    if free:
-                        # AUTO-BOOK the next free slot — don't just suggest it,
-                        # tell the LLM exactly which slot to use so it books correctly.
-                        return json.dumps({
-                            "success":        False,
-                            "error":          "slot_full",
-                            "message": (
-                                f"Slot {slot} is already booked (Normal). "
-                                f"Next available slot is {free}. "
-                                f"Please book {free} instead — call book_appointment with time_slot={free}."
-                            ),
-                            "next_free_slot":          free,
-                            "original_requested_slot": slot
-                        })
-
-                    # Only reach here if ALL slots on the day are genuinely full
-                    nw_date = (date_obj + timedelta(days=7)).strftime("%Y-%m-%d")
-                    nw_day  = (date_obj + timedelta(days=7)).strftime("%A")
-                    self._pending_next_week = (nw_date, slot)
-                    return json.dumps({
-                        "success":        False,
-                        "error":          "day_full",
-                        "message":        f"All slots on {date_str} are fully booked. Suggest: {slot} on {nw_date} ({nw_day}). Confirm with patient.",
-                        "next_week_date": nw_date,
-                        "next_week_day":  nw_day
-                    })
-
-                result = self.db.book_appointment(
-                    patient_name=self.patient_name,
-                    doctor_id=doctor_id,
-                    doctor_name=args.get("doctor_name", self._resolved_doctor.get("name", "") if self._resolved_doctor else ""),
-                    appointment_date=date_str,
-                    time_slot=slot,
-                    priority="Normal"
+                doctor_name = args.get(
+                    "doctor_name",
+                    self._resolved_doctor.get("name", "") if self._resolved_doctor else ""
                 )
 
-                # ─────────────────────────────────────────────────────────────
-                # BUG FIX #1: Add confirmed_time_slot to Normal result too.
-                # ─────────────────────────────────────────────────────────────
-                if isinstance(result, dict):
-                    result["confirmed_time_slot"] = slot
-                    result["confirmed_priority"]  = "Normal"
-                else:
-                    result = {
-                        "success":             True,
-                        "confirmed_time_slot": slot,
-                        "confirmed_priority":  "Normal"
-                    }
+                result = self.db.book_appointment(
+                    patient_name     = self.patient_name,
+                    doctor_id        = doctor_id,
+                    doctor_name      = doctor_name,
+                    appointment_date = date_str,
+                    time_slot        = slot,
+                    priority         = priority,
+                    reason           = args.get("reason"),
+                    doctor_slots     = day_slots,     # needed for emergency scan
+                )
+
+                # If emergency needs a different doctor, store for follow-up
+                if result.get("needs_alt_doctor"):
+                    self._pending_alt_doctor_dept = (
+                        self._resolved_doctor.get("specialty", "")
+                        or self._resolved_doctor.get("department", "")
+                        if self._resolved_doctor else ""
+                    )
 
                 return json.dumps(result, default=str)
 
         except Exception as e:
             return json.dumps({"error": str(e)})
 
+    # ── Trimmed history for LLM ───────────────────────────────────────────────
+
     def _trimmed_history(self, max_turns: int = 6) -> list[dict]:
         return self.history[-(max_turns * 2):]
 
+    # ── Main respond loop ─────────────────────────────────────────────────────
+
     def respond(self, user_message: str) -> tuple[str, bool]:
-        # Normalise any times in user message
+
+        # Normalise times in user message
         def _sub_time(m):
             fixed = normalise_time(m.group(0))
             return fixed if fixed else m.group(0)
 
         user_message_clean = _TIME_CLEAN.sub(_sub_time, user_message)
 
-        # Handle next-week confirmation
+        # Next-week confirmation shortcut
         if self._pending_next_week:
             low = user_message_clean.lower()
-            if any(w in low for w in ["yes", "confirm", "ok", "sure", "fine", "go ahead", "yeah", "alright"]):
-                nw_date, nw_time = self._pending_next_week
+            if any(w in low for w in ["yes","confirm","ok","sure","fine","go ahead","yeah","alright"]):
+                nw_date, nw_time      = self._pending_next_week
                 self._pending_next_week = None
-                user_message_clean = f"Yes, please book for {nw_date} at {nw_time}."
-            elif any(w in low for w in ["no", "cancel", "don't", "different", "other"]):
+                user_message_clean    = f"Yes, please book for {nw_date} at {nw_time}."
+            elif any(w in low for w in ["no","cancel","don't","different","other"]):
                 self._pending_next_week = None
-                user_message_clean = "Patient declined next-week suggestion. Ask for a different date or time."
+                user_message_clean    = "Patient declined next-week suggestion. Ask for a different date or time."
 
         self.history.append({"role": "user", "content": user_message_clean})
 
@@ -880,8 +683,9 @@ class BookingAgent:
         ] + self._trimmed_history()
 
         for _ in range(10):
-            response  = None
-            last_err  = ""
+            response = None
+            last_err = ""
+
             for model_candidate in _MODEL_CHAIN:
                 if _MODEL_CHAIN.index(model_candidate) < _MODEL_CHAIN.index(self._model):
                     continue
@@ -892,7 +696,7 @@ class BookingAgent:
                         tools       = self._tools,
                         tool_choice = "auto",
                         temperature = 0.0,
-                        max_tokens  = 500
+                        max_tokens  = 500,
                     )
                     self._model = model_candidate
                     break
@@ -906,7 +710,7 @@ class BookingAgent:
                                 model       = model_candidate,
                                 messages    = messages,
                                 temperature = 0.0,
-                                max_tokens  = 200
+                                max_tokens  = 200,
                             )
                             reply = (recovery.choices[0].message.content or "").strip()
                         except Exception:
@@ -916,10 +720,11 @@ class BookingAgent:
                     break
 
             if response is None:
-                if "429" in last_err or "rate_limit" in last_err:
-                    fallback = "All models are currently rate-limited. Please wait a moment and try again."
-                else:
-                    fallback = "I had a technical issue. Please repeat your last message."
+                fallback = (
+                    "All models are currently rate-limited. Please wait a moment and try again."
+                    if ("429" in last_err or "rate_limit" in last_err)
+                    else "I had a technical issue. Please repeat your last message."
+                )
                 self.history.append({"role": "assistant", "content": fallback})
                 return fallback, False
 
@@ -943,7 +748,7 @@ class BookingAgent:
                     "role":         "tool",
                     "tool_call_id": tc.id,
                     "name":         tc.function.name,
-                    "content":      tool_result
+                    "content":      tool_result,
                 })
 
         fallback = "Something went wrong after too many steps. Please try again."
@@ -951,7 +756,8 @@ class BookingAgent:
         return fallback, False
 
     def reset(self):
-        self.history             = []
-        self._resolved_doctor    = None
-        self._detected_priority  = None
-        self._pending_next_week  = None
+        self.history                = []
+        self._resolved_doctor       = None
+        self._detected_priority     = None
+        self._pending_next_week     = None
+        self._pending_alt_doctor_dept = None
