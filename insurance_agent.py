@@ -3,13 +3,6 @@ insurance_agent.py — Agent 3: The Insurance Clerk
 ==================================================
 Answers patient queries about insurance coverage, accepted plans,
 rates, and policies using RAG over a MongoDB Atlas vector store.
-
-Pattern mirrors BookingAgent:
-  - __init__(groq_api_key, mongo_uri, patient_name)
-  - respond(user_message) → reply_text
-  - reset()
-  - Sliding window history (last 10 turns)
-  - Never terminal — always returns to CHAT via router timeout logic
 """
 
 import os
@@ -23,24 +16,51 @@ from pymongo import MongoClient
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 _SYSTEM_PROMPT = (
-    "You are the official Virtual Assistant for Virtual Hospital, located in Mianwali, Pakistan. "
-    "Your job is to answer patient queries about insurance policies, accepted plans, rates, "
-    "and coverage using ONLY the provided context.\n\n"
+    "You are the Insurance Information Clerk at Harram Hospital, Mianwali, Pakistan. "
+    "You answer patient questions about insurance coverage, accepted plans, and billing policies "
+    "using ONLY the provided context documents.\n\n"
 
-    "CRITICAL RULES:\n"
-    "1. IDENTITY: You represent Virtual Hospital — NOT any insurance company.\n"
-    "2. ACCEPTED PLANS (cashless treatment only):\n"
-    "   - EFU: Corporate Healthcare, Mukammal Sehat, Rahbar Health Cover.\n"
-    "   - Jubilee: Family Health, Lifestyle Care, Personal Health.\n"
-    "   All other providers (Adamjee, State Life, etc.) are OUT-OF-NETWORK "
-    "   and require 100% upfront payment.\n"
-    "3. ADMISSION FILE FEE: Rs. 500 applies to ALL patients and is NOT covered by any insurance.\n"
-    "4. NO PERSONAL DATA: Never ask for policy numbers, CNICs, or private IDs.\n"
-    "5. EMPATHY: If the patient mentions an emergency or distress, respond with empathy first.\n"
-    "6. STRICT CONTEXT: If a detail isn't in the documents, say: "
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    "WHAT YOU CAN DO — nothing else, ever:\n"
+    "  1. Answer questions about which insurance plans are accepted\n"
+    "  2. Explain coverage details, cashless treatment eligibility\n"
+    "  3. Explain billing policies and admission fees\n"
+    "  4. Tell patients what documents to bring for insurance claims\n"
+    "  5. Clarify what is and isn't covered under specific plans\n\n"
+
+    "WHAT YOU CANNOT DO — never suggest, offer, or imply these:\n"
+    "  ✗ Contact any insurance company or manager on the patient's behalf\n"
+    "  ✗ Contact the front desk, any doctor, or any hospital staff\n"
+    "  ✗ File, process, or submit any insurance claim\n"
+    "  ✗ Access the patient's policy, records, or personal data\n"
+    "  ✗ Approve or reject any claim or coverage\n"
+    "  ✗ Send emails, messages, or make calls of any kind\n"
+    "  ✗ Book appointments — direct to the booking section\n"
+    "  ✗ Do ANYTHING outside of providing insurance information\n\n"
+
+    "If the patient asks for something outside this list, say:\n"
+    "  'I can only provide insurance information. For [their request], please visit\n"
+    "   the hospital billing desk or contact your insurance provider directly.'\n"
+    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    "ACCEPTED PLANS (cashless treatment only):\n"
+    "  - EFU: Corporate Healthcare, Mukammal Sehat, Rahbar Health Cover.\n"
+    "  - Jubilee: Family Health, Lifestyle Care, Personal Health.\n"
+    "  All other providers (Adamjee, State Life, etc.) are OUT-OF-NETWORK "
+    "and require 100% upfront payment.\n\n"
+
+    "ADMISSION FILE FEE: Rs. 500 applies to ALL patients and is NOT covered by any insurance.\n\n"
+
+    "STRICT RULES:\n"
+    "1. ONLY use information from the context documents provided below.\n"
+    "2. NEVER ask for policy numbers, CNICs, or any private patient data.\n"
+    "3. If a detail is not in the documents, say exactly:\n"
     "   'I cannot find that exact information in our current guidelines. "
-    "   Please contact our billing desk for clarification.'\n"
-    "7. TONE: Professional, warm, concise. Address the patient by name when natural.\n\n"
+    "Please contact our billing desk for clarification.'\n"
+    "4. Never make up coverage details, amounts, or plan names.\n"
+    "5. Be professional, warm, and concise. Address the patient by name when natural.\n"
+    "6. If the patient mentions an emergency or distress, respond with empathy first.\n\n"
+
     "Context from hospital documents:\n{context}"
 )
 
@@ -53,29 +73,18 @@ _PROMPT = ChatPromptTemplate.from_messages([
 
 class InsuranceAgent:
     def __init__(self, groq_api_key: str, mongo_uri: str, patient_name: str):
-        """
-        groq_api_key : Groq API key (can share with chat agent or be separate)
-        mongo_uri    : MongoDB Atlas URI — must have the insurance_knowledge_base collection
-        patient_name : Carried over from the router / login
-
-        NOTE: Heavy objects (HuggingFace embeddings, vector store, LLM) are
-        lazy-loaded on the FIRST respond() call — __init__ returns instantly
-        so the program starts without any delay.
-        """
         self.patient_name  = patient_name
         self._groq_api_key = groq_api_key
         self._mongo_uri    = mongo_uri
         self.history: list = []
 
-        # Lazy-loaded — None until first respond() call
+        # Lazy-loaded on first respond() call
         self._retriever = None
         self._llm       = None
 
-    # ── Lazy initialiser — called once, on first real query ──────────────────
     def _ensure_ready(self):
-        """Build the retriever and LLM the first time they are needed."""
         if self._retriever is not None:
-            return   # already initialised
+            return
 
         print("⏳ Loading insurance knowledge base (first use only)...")
 
@@ -99,26 +108,18 @@ class InsuranceAgent:
         )
         print("✅ Insurance knowledge base ready.")
 
-    # ── Sliding-window history (last 10 turns = 20 messages) ─────────────────
     def _trimmed_history(self, max_turns: int = 10) -> list:
         return self.history[-(max_turns * 2):]
 
-    # ── Core turn method ──────────────────────────────────────────────────────
     def respond(self, user_message: str) -> str:
-        """
-        Process one user turn.
-        Returns reply string. Never terminal — router decides when to leave.
-        """
-        self._ensure_ready()   # no-op after first call; loads model on first use
+        self._ensure_ready()
 
-        # Retrieve relevant document chunks
         try:
             docs = self._retriever.invoke(user_message)
             context_text = "\n\n".join(doc.page_content for doc in docs)
         except Exception:
-            context_text = ""   # degrade gracefully if vector store is unreachable
+            context_text = ""
 
-        # Build the prompt with trimmed history
         formatted = _PROMPT.format_messages(
             context=context_text,
             chat_history=self._trimmed_history(),
@@ -127,19 +128,17 @@ class InsuranceAgent:
 
         try:
             response = self._llm.invoke(formatted)
-            reply = response.content.strip()
+            reply    = response.content.strip()
         except Exception as e:
             reply = (
                 f"I'm sorry, {self.patient_name}, I'm having trouble accessing "
-                f"the insurance information right now. Please try again in a moment. ({e})"
+                f"the insurance information right now. Please try again in a moment."
             )
 
-        # Append to sliding-window history
         self.history.append(HumanMessage(content=user_message))
         self.history.append(AIMessage(content=reply))
 
         return reply
 
     def reset(self):
-        """Clear history between sessions."""
         self.history = []
