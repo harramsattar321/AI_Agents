@@ -16,7 +16,7 @@ from pymongo import MongoClient
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 _SYSTEM_PROMPT = (
-    "You are the Insurance Information Clerk at Harram Hospital, Mianwali, Pakistan. "
+    "You are the Insurance Information Clerk at Virtual Hospital, Mianwali, Pakistan. "
     "You answer patient questions about insurance coverage, accepted plans, and billing policies "
     "using ONLY the provided context documents.\n\n"
 
