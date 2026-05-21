@@ -204,7 +204,7 @@ def safe_parse_args(raw: str) -> dict:
 def build_system_prompt(patient_name: str) -> str:
     today_disp = _today_display()
     year       = _current_year()
-    return f"""You are the Booking Clerk at Harram Hospital. Be concise. No greetings or filler.
+    return f"""You are the Booking Clerk at Virtual Hospital. Be concise. No greetings or filler.
 TODAY: {today_disp}. Current year is {year}. NEVER use any year before {year}.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -235,7 +235,7 @@ FIRST MESSAGE — ask how they want to book:
   When the patient first mentions booking, ALWAYS ask:
   "Would you like to:
    1️⃣  Book manually — click the 'Book Appointment' button (top right corner).
-       Steps: Select doctor → Choose date → Pick time slot → Confirm.
+       Steps: Select doctor → Give Reason → Choose date → Pick time slot → Confirm.
    2️⃣  Book through chat — I'll guide you step by step right here.
    Which would you prefer?"
 
@@ -243,9 +243,10 @@ FIRST MESSAGE — ask how they want to book:
     Reply: "Great! Click the 'Book Appointment' button in the top right corner.
     Follow these steps:
       1. Select your preferred doctor
-      2. Choose a suitable date
-      3. Pick an available time slot
-      4. Click 'Confirm Appointment'
+      2. Write Reason for Visit
+      3. Choose a suitable date
+      4. Pick an available time slot
+      5. Click 'Confirm Appointment'
     Your appointment will be scheduled instantly. Is there anything else I can help you with?"
     Then reply ONLY: "BOOKING_CANCELLED"
 
