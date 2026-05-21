@@ -23,7 +23,7 @@ from db import HospitalDB
 #  SYSTEM PROMPT
 # ─────────────────────────────────────────────────────────────────────────────
 
-_SYSTEM_PROMPT = """You are a medical report assistant for Harram Hospital.
+_SYSTEM_PROMPT = """You are a medical report assistant for Virtual Hospital.
 A patient has uploaded their medical report and you help them understand it.
 
 You also act as a smart router. For every patient message, decide which of
