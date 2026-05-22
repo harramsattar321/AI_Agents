@@ -40,14 +40,99 @@ load_dotenv()
 # ─────────────────────────────────────────────────────────────────────────────
 #  CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
-MONGO_URI     = os.getenv("MONGO_URI")
-GROQ_KEY_CHAT = os.getenv("GROQ_KEY_CHAT")
-GROQ_KEY_BOOK = os.getenv("GROQ_KEY_BOOK")
-GROQ_KEY_INS  = os.getenv("GROQ_KEY_INS")
-GROQ_KEY_RPT  = os.getenv("GROQ_KEY_REPORT")
+MONGO_URI    = os.getenv("MONGO_URI")
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+ROUTER_MODEL = "llama-3.3-70b-versatile"
 
-GROQ_API_URL  = "https://api.groq.com/openai/v1/chat/completions"
-ROUTER_MODEL  = "llama-3.3-70b-versatile"
+# ─────────────────────────────────────────────────────────────────────────────
+#  KEY POOLS
+# ─────────────────────────────────────────────────────────────────────────────
+def _load_key_pool(prefix: str) -> list[str]:
+    """Collect PREFIX_1, PREFIX_2, ... from .env and return as a list."""
+    keys = []
+    i = 1
+    while True:
+        val = os.getenv(f"{prefix}_{i}")
+        if not val:
+            break
+        keys.append(val)
+        i += 1
+    return keys
+
+KEY_POOLS: dict[str, list[str]] = {
+    "chat":      _load_key_pool("GROQ_KEY_CHAT"),
+    "booking":   _load_key_pool("GROQ_KEY_BOOK"),
+    "insurance": _load_key_pool("GROQ_KEY_INS"),
+    "report":    _load_key_pool("GROQ_KEY_REPORT"),
+}
+
+# Current active index per pool
+_key_index: dict[str, int] = {k: 0 for k in KEY_POOLS}
+
+
+def get_key(pool: str) -> str:
+    """Return the currently active key for this pool."""
+    keys = KEY_POOLS[pool]
+    if not keys:
+        raise ValueError(f"No API keys loaded for pool: '{pool}'. Check your .env file.")
+    return keys[_key_index[pool]]
+
+
+def rotate_key(pool: str) -> str | None:
+    """
+    Advance to the next key in the pool.
+    Returns the new key, or None if all keys are exhausted.
+    """
+    keys  = KEY_POOLS[pool]
+    current = _key_index[pool]
+    if current + 1 < len(keys):
+        _key_index[pool] = current + 1
+        print(f"[KeyRotator] ↻  '{pool}' rotated to key index {_key_index[pool]}")
+        return keys[_key_index[pool]]
+    print(f"[KeyRotator] ⚠️  All keys exhausted for pool: '{pool}'")
+    return None
+
+
+def groq_request_with_fallback(pool: str, payload: dict, timeout: int = 10) -> dict:
+    """
+    POST to Groq API using the active key for `pool`.
+    On 429 (rate-limit) or 401 (bad/expired key), rotate to the next key
+    and retry automatically — until all keys in the pool are exhausted.
+    Raises the last HTTPError if every key fails.
+    """
+    while True:
+        key = get_key(pool)
+        try:
+            response = requests.post(
+                GROQ_API_URL,
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type":  "application/json",
+                },
+                json=payload,
+                timeout=timeout,
+            )
+
+            if response.status_code in (429, 401):
+                print(
+                    f"[KeyRotator] '{pool}' key failed "
+                    f"(HTTP {response.status_code}), trying next key..."
+                )
+                new_key = rotate_key(pool)
+                if new_key is None:
+                    response.raise_for_status()   # all keys dead → propagate
+                continue                           # retry with rotated key
+
+            response.raise_for_status()
+            return response.json()
+
+        except requests.exceptions.Timeout:
+            print(f"[KeyRotator] '{pool}' key timed out, trying next key...")
+            new_key = rotate_key(pool)
+            if new_key is None:
+                raise
+            # loop continues with new key
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  ROUTER SYSTEM PROMPT
@@ -79,7 +164,7 @@ REPORT LOADED: {report_loaded}
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  CANCEL / BOOKING TERMINAL HELPERS  (unchanged)
+#  CANCEL / BOOKING TERMINAL HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 _CANCEL_BOOKING_RE = re.compile(
     r"\b(cancel appointment|cancel my appointment|reschedule|re.?schedule"
@@ -112,33 +197,34 @@ class Router:
 
         self.db = HospitalDB(MONGO_URI)
 
+        # ── Agents — each receives its pool's current active key ──────────────
         self.chat_agent = HospitalChatbot(
             mongo_uri    = MONGO_URI,
-            groq_api_key = GROQ_KEY_CHAT,
+            groq_api_key = get_key("chat"),
             patient_name = patient_name,
         )
         self.chat_agent.db = self.db
 
         self.booking_agent = BookingAgent(
-            groq_api_key_2 = GROQ_KEY_BOOK,
+            groq_api_key_2 = get_key("booking"),
             db             = self.db,
             patient_name   = patient_name,
         )
 
         self.insurance_agent = InsuranceAgent(
-            groq_api_key = GROQ_KEY_INS,
+            groq_api_key = get_key("insurance"),
             mongo_uri    = MONGO_URI,
             patient_name = patient_name,
         )
 
         self.report_chatter = ReportChatter(
-            groq_api_key  = GROQ_KEY_RPT,
+            groq_api_key  = get_key("report"),
             db            = self.db,
             mongo_uri     = MONGO_URI,
-            groq_key_chat = GROQ_KEY_CHAT,
+            groq_key_chat = get_key("chat"),
         )
 
-        self.report_analyzer = ReportAnalyzer(groq_api_key=GROQ_KEY_RPT)
+        self.report_analyzer = ReportAnalyzer(groq_api_key=get_key("report"))
 
         # Report context — loaded once, lives for the whole session
         self._report_text:    str        = ""
@@ -147,7 +233,7 @@ class Router:
         # Full conversation history for the router LLM
         self._history: list[dict] = []
 
-        # Track last route so booking/insurance agents retain context
+        # Track last route so agents retain context on fallback
         self._last_route: str = "chat"
 
     # ── Report loaded? ────────────────────────────────────────────────────────
@@ -159,48 +245,35 @@ class Router:
     def _route(self, user_input: str) -> str:
         """
         Ask the router LLM which agent should handle this message.
+        Uses the 'chat' key pool with automatic fallback.
         Returns one of: "chat", "report", "insurance", "booking".
-        Falls back to "chat" on any error.
+        Falls back to last known route on any error.
         """
         system = _ROUTER_SYSTEM.format(
             report_loaded="YES" if self.has_report else "NO"
         )
 
-        # Give the router the last 10 turns for context (enough, not too expensive)
         recent_history = self._history[-10:]
-
         messages = [{"role": "system", "content": system}]
         messages.extend(recent_history)
         messages.append({"role": "user", "content": user_input})
 
         try:
-            response = requests.post(
-                GROQ_API_URL,
-                headers={
-                    "Authorization": f"Bearer {GROQ_KEY_CHAT}",
-                    "Content-Type":  "application/json",
-                },
-                json={
+            data = groq_request_with_fallback(
+                pool    = "chat",
+                payload = {
                     "model":       ROUTER_MODEL,
                     "messages":    messages,
-                    "temperature": 0.0,   # deterministic routing
-                    "max_tokens":  20,    # {"route": "chat"} is only ~10 tokens
+                    "temperature": 0.0,
+                    "max_tokens":  20,
                 },
-                timeout=10,
             )
-            response.raise_for_status()
-            raw = response.json()["choices"][0]["message"]["content"].strip()
-
-            # Parse JSON signal
+            raw   = data["choices"][0]["message"]["content"].strip()
             clean = re.sub(r"```(?:json)?|```", "", raw).strip()
-            data  = json.loads(clean)
-            route = data.get("route", "chat").lower()
+            route = json.loads(clean).get("route", "chat").lower()
 
-            # Validate
             if route not in ("chat", "report", "insurance", "booking"):
                 route = "chat"
-
-            # Never route to report if no report is loaded
             if route == "report" and not self.has_report:
                 route = "chat"
 
@@ -208,7 +281,7 @@ class Router:
 
         except Exception as e:
             print(f"[Router fallback] {e}")
-            return self._last_route  # safe: stay on last known agent
+            return self._last_route
 
     # ── Load PDF report ───────────────────────────────────────────────────────
     def load_report(self, pdf_path: str) -> str:
@@ -246,27 +319,15 @@ class Router:
         success, _, result = self.report_analyzer.analyze(fake_file)
 
         if not success:
-            self._report_text = ""   # rollback — don't route to report
+            self._report_text = ""
             return f"❌ Analysis failed: {result}"
 
-        # Reset report Q&A history (new report = fresh conversation)
         self._report_history = []
 
-        lines = [
-            "",
-            "═" * 56,
-            "  📋  REPORT ANALYSIS",
-            "═" * 56,
-            f"  Type    : {result.get('report_type', 'Unknown')}",
-            f"  Summary : {result.get('summary', '')}",
-        ]
-        for v in result.get("abnormal_values", []):
-            lines.append(
-                f"     • {v['name']}: {v['value']} "
-                f"(normal: {v['normal_range']}) [{v['status']}]"
-            ) if lines.count("\n  ⚠️  Abnormal Values:") == 0 else None
+        abnormal     = result.get("abnormal_values", [])
+        observations = result.get("key_observations", [])
+        advice       = result.get("advice", "")
 
-        # Rebuild properly
         lines = [
             "",
             "═" * 56,
@@ -275,7 +336,6 @@ class Router:
             f"  Type    : {result.get('report_type', 'Unknown')}",
             f"  Summary : {result.get('summary', '')}",
         ]
-        abnormal = result.get("abnormal_values", [])
         if abnormal:
             lines.append("\n  ⚠️  Abnormal Values:")
             for v in abnormal:
@@ -283,12 +343,10 @@ class Router:
                     f"     • {v['name']}: {v['value']} "
                     f"(normal: {v['normal_range']}) [{v['status']}]"
                 )
-        observations = result.get("key_observations", [])
         if observations:
             lines.append("\n  🔍  Key Observations:")
             for obs in observations:
                 lines.append(f"     • {obs}")
-        advice = result.get("advice", "")
         if advice:
             lines.append(f"\n  💡  Advice : {advice}")
         lines += [
@@ -304,11 +362,10 @@ class Router:
 
     # ── Single turn handler ───────────────────────────────────────────────────
     def handle(self, user_input: str) -> str:
-        # Keep history bounded
         if len(self._history) > 40:
             self._history = self._history[-40:]
 
-        # ── Cancel/reschedule shortcut (always goes to chat) ──────────────────
+        # ── Cancel/reschedule shortcut ────────────────────────────────────────
         if _CANCEL_BOOKING_RE.search(user_input):
             self.booking_agent.reset()
             reply = (
@@ -344,7 +401,6 @@ class Router:
                 history      = self._report_history,
                 patient_name = self.patient_name,
             )
-            # Update report-specific history
             self._report_history.append({"role": "user",      "content": user_input})
             self._report_history.append({"role": "assistant",  "content": reply})
             if len(self._report_history) > 12:
@@ -408,7 +464,6 @@ def main():
                 print(f"\nGoodbye, {name}! Stay healthy. 👋")
                 break
 
-            # ── /report <path> ────────────────────────────────────────────────
             if user_input.lower().startswith("/report"):
                 parts    = user_input.split(maxsplit=1)
                 pdf_path = parts[1].strip() if len(parts) > 1 else ""
