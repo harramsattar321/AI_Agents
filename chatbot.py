@@ -8,6 +8,7 @@ LLM formats a natural language reply from that context only.
 
 import re
 from groq import Groq
+
 from db import HospitalDB
 
 
